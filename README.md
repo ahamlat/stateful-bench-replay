@@ -4,31 +4,31 @@ Replay engine-API JSON-RPC streams (newPayload/forkchoiceUpdated) against a
 Besu snapshot mounted via OverlayFS so every sweep starts from the same chain
 state.
 
-Per sweep:
+Per selected test:
 
-1. Reset the two-layer overlay (umount both → wipe upper/work → remount).
-2. Start a Besu container with the test-layer merged overlay as its data dir.
+1. Reset the overlay (umount → wipe upper/work → remount). The chain on
+   disk is exactly the snapshot again.
+2. Start a Besu container with the overlay as its data dir.
 3. Wait for the Engine API to come up.
-4. Replay each prelude file in order (`gas-bump.txt`, `funding.txt`).
-5. Stop Besu.
-6. For each selected test (basename matched by `tests.filter`):
-   - wipe only the test overlay layer (prelude writes are preserved),
-   - start Besu, wait for the Engine API,
-   - replay `setup/<name>.txt` then `testing/<name>.txt`,
-   - stop Besu.
-7. Write a summary.
+4. Replay `gas-bump.txt`, `funding.txt`, `setup/<name>.txt`, then
+   `testing/<name>.txt`, all in this one container.
+5. Save the container's full log to `runs/<ts>/besu-<idx>.log` and stop
+   the container.
 
-## Per-test isolation (the only mode)
+So a run with N selected tests = N independent Besu containers, each
+doing the full prelude + test flow from a clean snapshot.
 
-Every test starts from the snapshot + prelude state and from a freshly
-restarted Besu. There is no "share one Besu across all tests" mode any
-more — running tests sequentially in the same process produced state-root
-mismatches because each test rewrites genesis-like contracts.
+## Per-test isolation
 
-The two-layer overlay makes the per-test reset cheap: the prelude writes
-live in `<overlay_dir>/prelude/upper`, the test writes live in
-`<overlay_dir>/test/upper`, and "reset the test layer" is just umount →
-`rm -rf test/upper test/work` → remount. No copy of multi-GB chain state.
+Every test sees the exact same warm-up: same snapshot, same gas-bump,
+same funding, same Besu version, same JVM, same caches. There is no
+shared state between tests, so the measured testing block always runs
+against an identical chain head.
+
+The cost is replaying the prelude (~5,000 gas-bump blocks + funding)
+once per test. On this VM that is ~30s, dominated by Besu importing
+gas-bump's empty blocks. If you select many tests at once, this will
+add up — the trade-off is total isolation.
 
 Run a single test with:
 
@@ -203,12 +203,25 @@ runs/20260427-104500/
 ```
 
 If `runs/<ts>/failures.jsonl` is empty, every replayed line returned
-`VALID` (or `SYNCING`/`ACCEPTED` where allowed by the Engine API spec).
+`VALID`. The runner is strict on purpose: `SYNCING`/`ACCEPTED` are
+recorded as failures because for deterministic replay against a prepped
+snapshot they mean "Besu is missing the parent block" — which always
+indicates a bug in the harness or the input data.
+
+`runs/<ts>/besu-<idx>.log` is the full `docker logs` of each test's
+Besu container, captured before the container was removed. Useful for
+hunting state-root mismatches or timing the actual test block:
+
+```bash
+LATEST=$(ls -1d runs/* | tail -n1)
+grep 'head =' "$LATEST/events.log"          # head before/after each phase
+grep 'Imported #' "$LATEST/besu-0001.log"   # block-by-block import log
+```
 
 ## Operational notes
 
 - `run.py` shells out to `sudo -n docker ...` for every container call and
-  to `sudo -n scripts/overlay.sh reset-all/reset-test ...` for every
+  to `sudo -n scripts/overlay.sh reset-all ...` for every
   filesystem call. The `-n` flag means none of them is allowed to prompt;
   that's why both must be in the sudoers allowlist (see bootstrap step 4).
 - If a sweep aborts immediately with `sudo -n docker version failed`, your

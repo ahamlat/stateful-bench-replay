@@ -271,20 +271,17 @@ def save_container_logs(name: str, dest: Path, log: SweepLog) -> None:
     log.event(f"saved {len(out.splitlines())} log lines to {dest}")
 
 
-def start_besu(cfg: BesuConfig, log: SweepLog, *, layer: str = "test") -> None:
-    """Boot Besu with its data-path bound to one of the two overlay layers.
+def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
+    """Boot Besu with its data-path bound to the test overlay layer.
 
-    layer="prelude" - used during the prelude phase. Writes (gas-bump +
-                      funding) land in <overlay_dir>/prelude/upper, which
-                      then becomes the persistent base for every test.
-    layer="test"    - used per test. Writes go to <overlay_dir>/test/upper,
-                      which is wiped (`reset-test`) between tests; the
-                      prelude/upper underneath is preserved.
+    Each benchmark run does the entire flow (gas-bump + funding + setup +
+    testing) in this single container, so there is no need to stage writes
+    across multiple overlay layers anymore. We always mount
+    <overlay_dir>/test/merged; the prelude overlay layer remains in the
+    on-disk layout for backwards compatibility but no longer holds state.
     """
-    if layer not in ("prelude", "test"):
-        raise ValueError(f"start_besu: unknown layer {layer!r}")
     stop_container(cfg.container_name)
-    merged = cfg.overlay_dir / layer / "merged"
+    merged = cfg.overlay_dir / "test" / "merged"
     # NOTE: no --rm here. We want the container to stick around if Besu
     # crashes, so wait_for_engine can dump `docker logs` on failure.
     # stop_container() above and at end-of-test cleans it up.
@@ -729,66 +726,71 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     sweep_ok = True
 
     try:
-        if cfg.run.reset_overlay:
-            overlay_reset_all(cfg.besu, log)
-        else:
-            overlay_mount_all(cfg.besu, log)
-
-        # Prelude container writes into the prelude layer so that gas-bump +
-        # funding state survives across the per-test resets below.
-        start_besu(cfg.besu, log, layer="prelude")
-        started_container = True
-        wait_for_engine(cfg.besu, secret, log)
-        log_chain_head(cfg.besu, log, "prelude container booted, head BEFORE replay")
-
         with requests.Session() as session:
-            # Phase 1: prelude (always runs once, in this Besu instance).
-            for name in cfg.input.prelude:
-                if not replay_file(cfg, secret, session, cfg.input.dir / name, log):
-                    sweep_ok = False
-                    log.event(f"fail-fast tripped during prelude {name}")
-                    break
+            # Each test runs end-to-end in ONE Besu container:
+            #   reset overlay -> start Besu -> gas-bump -> funding ->
+            #   setup -> testing -> stop Besu
+            # No mid-flight restarts: every test sees the exact same warm-up
+            # path before the measured block.
+            for idx, name in enumerate(tests, start=1):
+                log.event(f"[{idx}/{len(tests)}] {name}")
 
-            # Phase 2: per-test loop. Each test runs in a fresh Besu against
-            # a wiped test overlay layer (prelude state is preserved).
-            if sweep_ok:
-                log_chain_head(cfg.besu, log, "prelude replay complete, head AFTER prelude")
-                # Persist the prelude container's full log before we kill it.
-                save_container_logs(
-                    cfg.besu.container_name, log.root / "besu-prelude.log", log
+                # Wipe both overlay layers (prelude + test) and remount.
+                # Everything below writes into the test layer.
+                overlay_reset_all(cfg.besu, log)
+
+                start_besu(cfg.besu, log)
+                started_container = True
+                wait_for_engine(cfg.besu, secret, log)
+                log_chain_head(
+                    cfg.besu, log,
+                    f"[{idx}/{len(tests)}] head BEFORE prelude"
                 )
-                # Stop the prelude-running Besu before the first per-test reset.
-                stop_container(cfg.besu.container_name)
-                for idx, name in enumerate(tests, start=1):
-                    log.event(f"[{idx}/{len(tests)}] {name}")
-                    overlay_reset_test(cfg.besu, log)
-                    # Per-test container writes into the test layer (which
-                    # gets wiped on the next reset-test).
-                    start_besu(cfg.besu, log, layer="test")
-                    wait_for_engine(cfg.besu, secret, log)
-                    log_chain_head(
-                        cfg.besu, log,
-                        f"test container booted ({idx}/{len(tests)}), head BEFORE replay"
-                    )
-                    if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
-                        sweep_ok = False
-                        # Save logs for the failing test before tearing down.
-                        save_container_logs(
-                            cfg.besu.container_name,
-                            log.root / f"besu-test-{idx:04d}-FAIL.log",
-                            log,
-                        )
+
+                test_ok = True
+
+                # Phase A: prelude (gas-bump.txt then funding.txt) in this
+                # same container. Writes go into the test overlay layer.
+                for fname in cfg.input.prelude:
+                    if not replay_file(
+                        cfg, secret, session,
+                        cfg.input.dir / fname, log, phase="prelude",
+                    ):
+                        test_ok = False
+                        log.event(f"fail-fast tripped during prelude {fname}")
                         break
+
+                if test_ok:
                     log_chain_head(
                         cfg.besu, log,
-                        f"test {idx}/{len(tests)} done, head AFTER replay"
+                        f"[{idx}/{len(tests)}] head AFTER prelude"
                     )
-                    save_container_logs(
-                        cfg.besu.container_name,
-                        log.root / f"besu-test-{idx:04d}.log",
-                        log,
-                    )
-                    stop_container(cfg.besu.container_name)
+                    # Phase B: setup + testing in the SAME container.
+                    if not _run_test_pair(
+                        cfg, secret, session,
+                        setup_dir, testing_dir, name, log,
+                    ):
+                        test_ok = False
+                    else:
+                        log_chain_head(
+                            cfg.besu, log,
+                            f"[{idx}/{len(tests)}] head AFTER replay"
+                        )
+
+                # Persist full container log before we tear it down. Failed
+                # runs get a -FAIL suffix to make them easy to spot.
+                suffix = "" if test_ok else "-FAIL"
+                save_container_logs(
+                    cfg.besu.container_name,
+                    log.root / f"besu-{idx:04d}{suffix}.log",
+                    log,
+                )
+                stop_container(cfg.besu.container_name)
+                started_container = False
+
+                if not test_ok:
+                    sweep_ok = False
+                    break
 
         log.event(f"sweep end: ok={sweep_ok}")
     finally:
