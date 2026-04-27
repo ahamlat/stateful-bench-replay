@@ -555,6 +555,20 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None, dry_r
     if not cfg.besu.jwt_secret_path.is_file():
         raise FileNotFoundError(f"jwt secret missing: {cfg.besu.jwt_secret_path}")
 
+    # Validate every host bind-mount source up front: if it doesn't exist
+    # `docker run` silently creates an empty directory there, the container
+    # then sees a directory where it expected a file (e.g. genesis), Besu
+    # fails before log4j and `docker logs` is empty. We've been bitten.
+    for spec in cfg.besu.extra_mounts:
+        host = spec.split(":", 1)[0]
+        if not host or not Path(host).exists():
+            raise FileNotFoundError(
+                f"besu.extra_mounts host path does not exist: {host!r} "
+                f"(from spec {spec!r}). Create it before running, or fix the "
+                "config: a missing host path makes docker silently create an "
+                "empty directory and Besu will fail to start with no logs."
+            )
+
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
