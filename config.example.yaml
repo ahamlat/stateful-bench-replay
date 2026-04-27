@@ -104,15 +104,12 @@ tests:
   order: alphabetical
 
 run:
-  # Per-test isolation strategy:
-  #   sweep   - reset overlay once, run prelude, then run ALL selected tests
-  #             sequentially in the same Besu process. Fastest, no per-test
-  #             reset. Tests share the chain head.
-  #   restart - reset overlay once, run prelude, then for EACH test:
-  #             stop Besu -> wipe ONLY the test layer (preserves prelude
-  #             writes via the two-layer overlay) -> start Besu -> setup+test.
-  #             Strongest isolation; cost ~ one docker restart per test (a few s).
-  isolation: sweep
+  # The runner always uses per-test isolation: at the start of every sweep
+  # both overlay layers are wiped and Besu is started; the prelude
+  # (gas-bump.txt then funding.txt) is replayed once into the prelude layer;
+  # then for EACH selected test, Besu is stopped, ONLY the test layer is
+  # wiped (the two-layer overlay preserves the prelude writes), Besu is
+  # restarted, and setup/<name>.txt + testing/<name>.txt are replayed.
 
   # Reset (umount + wipe upper/work + remount) the FULL overlay (both layers)
   # at the start of every sweep. Set false to resume from the previous run's

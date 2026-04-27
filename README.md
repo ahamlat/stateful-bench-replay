@@ -10,29 +10,30 @@ Per sweep:
 2. Start a Besu container with the test-layer merged overlay as its data dir.
 3. Wait for the Engine API to come up.
 4. Replay each prelude file in order (`gas-bump.txt`, `funding.txt`).
-5. For each selected test (basename matched by `tests.filter`): replay
-   `setup/<name>.txt` then `testing/<name>.txt`. The exact mechanics depend
-   on `run.isolation` (see below).
-6. Stop the container and write a summary.
+5. Stop Besu.
+6. For each selected test (basename matched by `tests.filter`):
+   - wipe only the test overlay layer (prelude writes are preserved),
+   - start Besu, wait for the Engine API,
+   - replay `setup/<name>.txt` then `testing/<name>.txt`,
+   - stop Besu.
+7. Write a summary.
 
-## Isolation modes
+## Per-test isolation (the only mode)
 
-`run.isolation` controls what happens between tests:
+Every test starts from the snapshot + prelude state and from a freshly
+restarted Besu. There is no "share one Besu across all tests" mode any
+more — running tests sequentially in the same process produced state-root
+mismatches because each test rewrites genesis-like contracts.
 
-| Mode    | Per-test reset | Besu restarts? | Speed | Notes |
-| ------- | -------------- | -------------- | ----- | ----- |
-| `sweep` (default) | none | no  | fastest | All tests run in one Besu process. Tests share the canonical head; later tests see writes from earlier ones. |
-| `restart` | wipe only the test overlay layer | yes | slow (~few s/test) | Strongest isolation. Prelude writes are preserved by the two-layer overlay so gas-bump+funding don't have to be replayed each time. |
+The two-layer overlay makes the per-test reset cheap: the prelude writes
+live in `<overlay_dir>/prelude/upper`, the test writes live in
+`<overlay_dir>/test/upper`, and "reset the test layer" is just umount →
+`rm -rf test/upper test/work` → remount. No copy of multi-GB chain state.
 
-The two-layer overlay makes `restart` cheap: the prelude writes live in
-`<overlay_dir>/prelude/upper`, the test writes live in
-`<overlay_dir>/test/upper`, and "reset the test layer" is just umount → `rm
--rf test/upper test/work` → remount. No copy of multi-GB chain state.
-
-Override the YAML setting on the CLI:
+Run a single test with:
 
 ```bash
-./runBenchmark.sh --isolation restart --filter '*BALANCE*30M*'
+./runBenchmark.sh --filter '*test_single_opcode.py__test_sload_bloated*' --limit 1
 ```
 
 ## Besu command line
@@ -147,7 +148,6 @@ Key fields:
 - `input.dir`: where you rsync'd the generated tests.
 - `input.prelude`: ordered list, must be `[gas-bump.txt, funding.txt]` for this dataset (gas-bump is built on the snapshot tip, funding is built on the gas-bump tip).
 - `tests.filter`: glob over basenames; `"*"` runs all tests.
-- `run.isolation`: `sweep` (default) or `restart`.
 
 ## Run
 
@@ -157,11 +157,12 @@ first call, installs `requirements.txt`, and forwards every argument to
 
 ```bash
 # First call also bootstraps ./venv/ from requirements.txt.
-./runBenchmark.sh --dry-run                  # validate config + show selection
-./runBenchmark.sh                            # full sweep with config.yaml
-./runBenchmark.sh --filter '*BALANCE*30M*'   # filter override
-./runBenchmark.sh -c staging.yaml            # different config
-CONFIG=staging.yaml ./runBenchmark.sh        # same, via env var
+./runBenchmark.sh --dry-run                              # validate config + show selection
+./runBenchmark.sh                                        # full sweep with config.yaml
+./runBenchmark.sh --filter '*BALANCE*30M*'               # filter override
+./runBenchmark.sh --filter '*sload_bloated*' --limit 1   # one test only (handy for debugging)
+./runBenchmark.sh -c staging.yaml                        # different config
+CONFIG=staging.yaml ./runBenchmark.sh                    # same, via env var
 ```
 
 You can still call `run.py` directly if you prefer:
@@ -187,9 +188,17 @@ If `runs/<ts>/failures.jsonl` is empty, every replayed line returned
 ## Operational notes
 
 - `run.py` runs `sudo -n scripts/overlay.sh reset-all ...` at the start of
-  each sweep, and `sudo -n scripts/overlay.sh reset-test ...` between tests
-  in `restart` mode. The `-n` flag means the call must not prompt; that's
-  why the sudoers allowlist above is required.
+  each sweep and `sudo -n scripts/overlay.sh reset-test ...` between tests.
+  The `-n` flag means the call must not prompt; that's why the sudoers
+  allowlist above is required.
+- If you see `overlay.sh: unknown action: reset-all` (or `reset-test` /
+  `mount-all`) the helper installed at the sudoers-allowlisted path is an
+  older single-layer version. Re-run the install step to refresh it:
+
+  ```bash
+  sudo install -m 0755 scripts/overlay.sh /usr/local/sbin/besu-overlay.sh
+  ln -sf /usr/local/sbin/besu-overlay.sh scripts/overlay.sh
+  ```
 - The Besu container is started with `--network host` so the runner can hit
   `127.0.0.1:8551` directly. Change `besu.engine_url` and drop `--network
   host` from `start_besu` in `run.py` if you need port mapping instead.
@@ -200,16 +209,11 @@ If `runs/<ts>/failures.jsonl` is empty, every replayed line returned
 
 ## Caveats / open assumptions
 
-- In `sweep` mode, all selected tests run as forks off the funding tip in
-  a single Besu process. If your snapshot's storage format hits reorg-depth
-  limits part way through a sweep, either bump the relevant Besu flag in
-  `besu.extra_args` (e.g. `--bonsai-historical-block-limit=...`), switch
-  to `--isolation restart`, or split the suite via `--filter`.
-- In `restart` mode, expect ~5-15 s overhead per test for docker
-  stop/start + Engine API readiness. The full 1 134-test sweep will take
-  noticeably longer than `sweep` mode (1-2 minutes/test x 1134 ≈ hours).
-  Use `--filter` aggressively or run `restart` only on the subset you care
-  about.
+- Expect ~5-15 s overhead per test for docker stop/start + Engine API
+  readiness on top of the actual block replay time. The full 1 134-test
+  suite is therefore long-running (≈ 1-2 minutes/test × 1134 → hours).
+  Use `--filter` aggressively, or use `--limit N` to cap the run while
+  iterating.
 - The runner only logs failures (per the chosen "minimal" metrics mode).
   Adding per-call latency would be a few extra fields in `replay_file` and
   a CSV writer; the JSONL format makes this easy to bolt on later.

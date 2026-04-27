@@ -4,16 +4,20 @@
 Boots a Besu container against an OverlayFS-mounted snapshot and replays
 JSON-RPC newPayload/forkchoiceUpdated lines through the Engine API.
 
-Two isolation modes (run.isolation):
-  * sweep   - reset overlay once per invocation, then run prelude + all tests
-              sequentially in one Besu process. Fastest, no per-test isolation.
-  * restart - reset overlay once, run prelude, then per test:
-              stop Besu -> wipe ONLY the test layer (preserves prelude
-              writes via two-layer overlay) -> start Besu -> run setup+test.
-              Strongest isolation; cost ~= one docker restart per test.
+Per sweep:
+  1. Reset both overlay layers (prelude + test) and start Besu.
+  2. Replay prelude (gas-bump.txt then funding.txt).
+  3. Stop Besu.
+  4. For each selected test:
+       - reset ONLY the test overlay layer (prelude writes are preserved by
+         the two-layer overlay, so gas-bump+funding don't have to be replayed)
+       - start Besu, wait for Engine API
+       - replay setup/<name>.txt then testing/<name>.txt
+       - stop Besu
+  5. Write summary.
 
 Usage:
-    python3 run.py --config config.yaml [--filter '*BALANCE*'] [--dry-run]
+    python3 run.py --config config.yaml [--filter '*BALANCE*'] [--limit 1] [--dry-run]
 
 See config.example.yaml for the schema.
 """
@@ -77,7 +81,6 @@ class RunConfig:
     request_timeout_s: int
     fail_fast: bool
     stop_container_on_exit: bool
-    isolation: str  # sweep | restart
 
 
 @dataclasses.dataclass
@@ -88,9 +91,6 @@ class Config:
     run: RunConfig
 
 
-_VALID_ISOLATION = {"sweep", "restart"}
-
-
 def _abs_path(p: str | os.PathLike) -> Path:
     return Path(p).expanduser().resolve()
 
@@ -98,9 +98,12 @@ def _abs_path(p: str | os.PathLike) -> Path:
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text())
     b, i, t, r = raw["besu"], raw["input"], raw["tests"], raw["run"]
-    isolation = str(r.get("isolation", "sweep")).lower()
-    if isolation not in _VALID_ISOLATION:
-        raise ValueError(f"run.isolation must be one of {_VALID_ISOLATION}, got {isolation!r}")
+    if "isolation" in r:
+        print(
+            "warn: run.isolation is no longer used (only the per-test restart mode "
+            "is supported); ignoring it",
+            file=sys.stderr,
+        )
     return Config(
         besu=BesuConfig(
             image=b["image"],
@@ -130,7 +133,6 @@ def load_config(path: Path) -> Config:
             request_timeout_s=int(r.get("request_timeout_s", 120)),
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
-            isolation=isolation,
         ),
     )
 
@@ -226,8 +228,9 @@ def stop_container(name: str) -> None:
 
 def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     stop_container(cfg.container_name)
-    # The container always sees the test-layer merged dir. Underneath it is
-    # the prelude layer (if isolation != sweep) or just the snapshot.
+    # The container always sees the test-layer merged dir; the test layer
+    # stacks on top of the prelude layer, which itself stacks on the
+    # read-only snapshot.
     merged = cfg.overlay_dir / "test" / "merged"
     docker_cmd: list[str] = [
         "docker", "run", "-d", "--rm",
@@ -259,7 +262,23 @@ def _overlay(action: str, cfg: BesuConfig, log: SweepLog, *extra_args: str) -> N
         cmd += [str(cfg.overlay_dir)]
     cmd += list(extra_args)
     log.event(f"overlay {action}: " + " ".join(shlex.quote(a) for a in cmd))
-    _run(cmd)
+    try:
+        _run(cmd)
+    except subprocess.CalledProcessError:
+        # The two-layer actions (mount-all, reset-all, reset-test) were added
+        # together; if any of them is rejected with "unknown action", the
+        # installed overlay.sh is from before that change.
+        if action in ("mount-all", "reset-all", "reset-test"):
+            print(
+                "\nbench: overlay.sh rejected this action. The installed copy is "
+                "probably an older single-layer version.\n"
+                "       Refresh it with:\n"
+                f"         sudo install -m 0755 {OVERLAY_SCRIPT} /usr/local/sbin/besu-overlay.sh\n"
+                f"         ln -sf /usr/local/sbin/besu-overlay.sh {OVERLAY_SCRIPT}\n"
+                "       (and make sure your sudoers allowlists the new script path).\n",
+                file=sys.stderr,
+            )
+        raise
 
 
 def overlay_reset_all(cfg: BesuConfig, log: SweepLog) -> None:
@@ -420,7 +439,7 @@ def replay_file(
 # Test discovery
 # ---------------------------------------------------------------------------
 
-def discover_tests(cfg: Config, filter_override: str | None) -> list[str]:
+def discover_tests(cfg: Config, filter_override: str | None, limit: int | None) -> list[str]:
     """Return ordered list of basenames present in BOTH setup/ and testing/ that match the filter."""
     pattern = filter_override or cfg.tests.filter
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
@@ -452,6 +471,8 @@ def discover_tests(cfg: Config, filter_override: str | None) -> list[str]:
         random.shuffle(matched)
     else:
         raise ValueError(f"unknown tests.order: {order}")
+    if limit is not None and limit >= 0:
+        matched = matched[:limit]
     return matched
 
 
@@ -470,14 +491,17 @@ def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
     return True
 
 
-def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
+def run_sweep(cfg: Config, filter_override: str | None, limit: int | None, dry_run: bool) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
-    log.event(f"sweep start, log dir = {log_root}, isolation = {cfg.run.isolation}")
+    log.event(f"sweep start, log dir = {log_root}")
 
-    tests = discover_tests(cfg, filter_override)
-    log.event(f"matched {len(tests)} tests (filter={filter_override or cfg.tests.filter}, order={cfg.tests.order})")
+    tests = discover_tests(cfg, filter_override, limit)
+    log.event(
+        f"matched {len(tests)} tests "
+        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
+    )
 
     if dry_run:
         (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
@@ -518,26 +542,20 @@ def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
                     log.event(f"fail-fast tripped during prelude {name}")
                     break
 
-            if not sweep_ok:
-                pass
-            elif cfg.run.isolation == "sweep":
-                # All tests in one Besu, no per-test reset.
+            # Phase 2: per-test loop. Each test runs in a fresh Besu against
+            # a wiped test overlay layer (prelude state is preserved).
+            if sweep_ok:
+                # Stop the prelude-running Besu before the first per-test reset.
+                stop_container(cfg.besu.container_name)
                 for idx, name in enumerate(tests, start=1):
                     log.event(f"[{idx}/{len(tests)}] {name}")
-                    if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
-                        sweep_ok = False
-                        break
-
-            elif cfg.run.isolation == "restart":
-                # Per test: stop besu, reset only the test layer, start besu, run pair.
-                for idx, name in enumerate(tests, start=1):
-                    log.event(f"[{idx}/{len(tests)}] {name}")
-                    stop_container(cfg.besu.container_name)
                     overlay_reset_test(cfg.besu, log)
                     start_besu(cfg.besu, log)
                     wait_for_engine(cfg.besu, secret, log)
                     if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
-                        sweep_ok = False; break
+                        sweep_ok = False
+                        break
+                    stop_container(cfg.besu.container_name)
 
         log.event(f"sweep end: ok={sweep_ok}")
     finally:
@@ -548,7 +566,7 @@ def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
                 "input_dir": str(cfg.input.dir),
                 "filter": filter_override or cfg.tests.filter,
                 "order": cfg.tests.order,
-                "isolation": cfg.run.isolation,
+                "limit": limit,
                 "selected_tests": len(tests),
             },
             "fail_fast_tripped": not sweep_ok,
@@ -570,8 +588,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--config", "-c", default="config.yaml", help="path to YAML config")
     p.add_argument("--filter", "-f", default=None,
                    help="override tests.filter glob (e.g. '*BALANCE*30M*')")
-    p.add_argument("--isolation", choices=sorted(_VALID_ISOLATION), default=None,
-                   help="override run.isolation (sweep | restart)")
+    p.add_argument("--limit", "-n", type=int, default=None,
+                   help="run at most N tests after filtering (use --limit 1 for a single test)")
     p.add_argument("--dry-run", action="store_true",
                    help="resolve config + selected tests, then exit without touching the system")
     return p.parse_args(argv)
@@ -587,10 +605,8 @@ def _install_sigint_handler() -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = load_config(_abs_path(args.config))
-    if args.isolation is not None:
-        cfg = dataclasses.replace(cfg, run=dataclasses.replace(cfg.run, isolation=args.isolation))
     _install_sigint_handler()
-    return run_sweep(cfg, filter_override=args.filter, dry_run=args.dry_run)
+    return run_sweep(cfg, filter_override=args.filter, limit=args.limit, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
