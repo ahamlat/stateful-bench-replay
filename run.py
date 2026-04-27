@@ -58,6 +58,7 @@ class BesuConfig:
     extra_mounts: list[str]
     startup_timeout_s: int
     container_data_path: str
+    entrypoint: str | None
 
 
 @dataclasses.dataclass
@@ -116,6 +117,7 @@ def load_config(path: Path) -> Config:
             extra_mounts=list(b.get("extra_mounts") or []),
             startup_timeout_s=int(b.get("startup_timeout_s", 120)),
             container_data_path=str(b.get("container_data_path", "/opt/besu/data")),
+            entrypoint=(str(b["entrypoint"]) if b.get("entrypoint") else None),
         ),
         input=InputConfig(
             dir=_abs_path(i["dir"]),
@@ -271,6 +273,8 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
         "--network", "host",
         "-v", f"{merged}:{cfg.container_data_path}",
     ]
+    if cfg.entrypoint:
+        docker_cmd += ["--entrypoint", cfg.entrypoint]
     for spec in cfg.extra_mounts:
         docker_cmd += ["-v", spec]
     docker_cmd.append(cfg.image)

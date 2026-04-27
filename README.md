@@ -41,8 +41,9 @@ Run a single test with:
 The runner builds the `docker run` invocation as:
 
 ```bash
-docker run -d --rm --name <besu.container_name> --network host \
+sudo -n docker run -d --name <besu.container_name> --network host \
   -v <overlay_dir>/test/merged:<besu.container_data_path> \
+  [--entrypoint <besu.entrypoint>] \
   -v <each entry from besu.extra_mounts> \
   <besu.image> \
   --data-path=<besu.container_data_path> \
@@ -54,6 +55,27 @@ overlay management. Everything else (engine RPC, JWT path, genesis, BAL
 flags, metrics, etc.) is up to you in `besu.extra_args`. The JWT path you
 put after `--engine-jwt-secret=` must match the in-container path you set
 up with `besu.extra_mounts`.
+
+### `besu.entrypoint`
+
+Some Besu images ship a wrapper script as their entrypoint that does
+`chown -R besu:besu /opt/besu/data` before exec'ing Besu. On a multi-GB
+Bonsai snapshot bind-mounted over OverlayFS, that recursive chown forces
+millions of copy-ups and can sit silently for many minutes. The classic
+symptom is "the container is running, `docker logs` is empty, eventually
+the Engine API timeout fires" — and `top` on the host shows one or more
+`chown` processes in `D` state.
+
+Set `besu.entrypoint` to the real Besu launcher to skip the wrapper:
+
+```yaml
+besu:
+  image: ethpandaops/besu:bal-devnet-2-with-prefetch
+  entrypoint: /opt/besu/bin/besu
+```
+
+Leave it commented out for stock `hyperledger/besu:*` images, whose
+default entrypoint is already the launcher.
 
 ## Layout
 

@@ -25,6 +25,14 @@ besu:
   # in extra_args).
   container_data_path: /opt/besu/data
 
+  # Optional: override the image's ENTRYPOINT. Some images (e.g.
+  # ethpandaops/besu) ship a wrapper that does `chown -R besu:besu
+  # /opt/besu/data` before exec'ing besu. On a multi-GB Bonsai snapshot
+  # over OverlayFS that recursive chown can take many minutes with zero
+  # log output. Pointing at the real launcher skips it entirely.
+  # Leave commented out for stock hyperledger/besu images.
+  entrypoint: /opt/besu/bin/besu
+
   # JWT secret on the HOST. The runner reads this file to sign Engine API
   # requests. Bind-mount it into the container yourself via extra_mounts
   # below (so you can name the in-container path freely).
