@@ -13,37 +13,80 @@ besu:
   # snapshot itself is never written to.
   data_snapshot_dir: /data/besu
 
-  # Overlay scratch root. Must contain (or will be created with) upper/, work/,
-  # merged/. Wiped at the start of every sweep when run.reset_overlay is true.
+  # Two-layer overlay scratch root. The runner / overlay.sh creates:
+  #   <overlay_dir>/prelude/{upper,work,merged}   - writes from gas-bump+funding
+  #   <overlay_dir>/test/{upper,work,merged}      - writes from current test
+  # Besu always mounts <overlay_dir>/test/merged at container_data_path.
   overlay_dir: /data/besu-overlay
 
-  # 32-byte hex JWT secret shared by Besu and the runner.
-  # Generate once: `openssl rand -hex 32 | sudo tee /data/jwt.hex >/dev/null`.
-  jwt_secret_path: /data/jwt.hex
+  # Where the overlay's test/merged is bind-mounted inside the container.
+  # Must match the --data-path you put in extra_args (the runner adds
+  # --data-path=<container_data_path> automatically; do NOT also list it
+  # in extra_args).
+  container_data_path: /opt/besu/data
+
+  # JWT secret on the HOST. The runner reads this file to sign Engine API
+  # requests. Bind-mount it into the container yourself via extra_mounts
+  # below (so you can name the in-container path freely).
+  jwt_secret_path: /tmp/jwtsecret
 
   # Engine API endpoint as reachable from the host running run.py.
   # With `--network host` this is 127.0.0.1:8551.
   engine_url: http://127.0.0.1:8551
 
-  # Extra arguments appended to the `besu` command line inside the container.
-  # Tune for your snapshot's network / storage format.
+  # Files / directories bind-mounted into the container, in addition to the
+  # overlay test/merged → container_data_path mount the runner always adds.
+  # Format: "host_path:container_path[:ro]" (standard `docker -v` syntax).
+  extra_mounts:
+    - /tmp/jwtsecret:/tmp/jwtsecret:ro
+    - /tmp/genesis.json:/tmp/genesis.json:ro
+
+  # Full Besu command line. The runner prepends ONLY --data-path=<container_data_path>;
+  # everything else is your call. JWT path / genesis path here must match the
+  # in-container paths from extra_mounts above.
   extra_args:
-    - --network=DEV
-    - --sync-mode=FULL
     - --data-storage-format=BONSAI
-    - --rpc-http-enabled=false
+    - --p2p-enabled=false
+    - --sync-mode=FULL
+    - --max-peers=0
+    - --discovery-enabled=false
+    - --rpc-http-enabled=true
+    - --rpc-http-host=0.0.0.0
+    - --rpc-http-port=8545
+    - --rpc-http-api=ETH,NET,DEBUG,MINER,NET,PERM,ADMIN,TXPOOL,WEB3
+    - --rpc-http-cors-origins=*
+    - --Xhttp-timeout-seconds=660
+    - --host-allowlist=*
+    - --engine-rpc-enabled=true
+    - --engine-jwt-secret=/tmp/jwtsecret
+    - --engine-rpc-port=8551
+    - --engine-host-allowlist=*
+    - --metrics-enabled=true
+    - --metrics-host=0.0.0.0
+    - --metrics-port=8008
+    - --genesis-file=/tmp/genesis.json
+    - --Xbal-state-root-timeout=-1
+    - --Xbal-processing-timeout=-1
+    - --Xbal-optimization-enabled=false
+    - --Xbal-perfect-parallelization-enabled=false
+    - --Xbal-trust-state-root=false
 
   # Seconds to wait for the Engine API to become responsive after `docker run`.
+  # In `restart` isolation mode this timeout is also used per test, so set it
+  # generously enough to cover Besu's cold start.
   startup_timeout_s: 120
 
 input:
   # Directory containing funding.txt, gas-bump.txt, setup/, testing/.
-  dir: /home/ubuntu/reproduce-8038/generated-stateful-tests-stateful-perf-devnet-3-24656413846
+  dir: /home/ahamlat/reproduce-8038
 
-  # Files replayed before any test, in the listed order.
+  # Files replayed before any test, IN ORDER. The chain is built bottom-up:
+  # snapshot tip -> gas-bump (5000 blocks) -> funding (1 block) -> tests.
+  # Reversing this order will fail because funding's parentHash is the
+  # gas-bump tip.
   prelude:
-    - funding.txt
     - gas-bump.txt
+    - funding.txt
 
 tests:
   setup_subdir: setup
@@ -52,7 +95,7 @@ tests:
   # Glob over basenames in setup_subdir. Matched names must also exist in
   # testing_subdir; pairs that don't match are skipped with a warning.
   # Examples:
-  #   "*"                                   -> all 1136 tests
+  #   "*"                                   -> all tests
   #   "*BALANCE*30M*"                       -> only BALANCE 30M cases
   #   "test_account_query.py__*"            -> all account_query tests
   filter: "*"
@@ -61,8 +104,19 @@ tests:
   order: alphabetical
 
 run:
-  # Reset (umount + wipe upper/work + remount) the overlay at the start of
-  # every sweep. Set false to resume from previous run's writes.
+  # Per-test isolation strategy:
+  #   sweep   - reset overlay once, run prelude, then run ALL selected tests
+  #             sequentially in the same Besu process. Fastest, no per-test
+  #             reset. Tests share the chain head.
+  #   restart - reset overlay once, run prelude, then for EACH test:
+  #             stop Besu -> wipe ONLY the test layer (preserves prelude
+  #             writes via the two-layer overlay) -> start Besu -> setup+test.
+  #             Strongest isolation; cost ~ one docker restart per test (a few s).
+  isolation: sweep
+
+  # Reset (umount + wipe upper/work + remount) the FULL overlay (both layers)
+  # at the start of every sweep. Set false to resume from the previous run's
+  # writes (rare; only useful for incremental experiments).
   reset_overlay: true
 
   # Per-sweep timestamped subdirectory is created under this path.

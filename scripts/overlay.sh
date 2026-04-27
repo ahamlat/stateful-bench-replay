@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
-# overlay.sh - manage the OverlayFS used to throw away Besu writes between sweeps.
+# overlay.sh - manage the OverlayFS layers used to throw away Besu writes.
 #
-# Layout under <overlay_root>:
-#   lower   = <snapshot_dir>            (read-only Besu snapshot)
-#   upper   = <overlay_root>/upper      (sweep writes land here)
-#   work    = <overlay_root>/work       (overlay metadata)
-#   merged  = <overlay_root>/merged     (the union, mounted to Besu container)
+# Two-layer layout under <overlay_root>:
+#   lower (snapshot, read-only)    = <snapshot_dir>
+#   prelude/{upper,work,merged}    = writes from funding + gas-bump (kept across tests)
+#   test/{upper,work,merged}       = writes from the current test (resettable)
+#
+# Besu mounts <overlay_root>/test/merged. Underneath, the test layer's lower
+# is the prelude layer's merged view, and the prelude layer's lower is the
+# untouched snapshot. So:
+#   - reset-all  -> wipe both layers (full reset; needed before re-running prelude)
+#   - reset-test -> wipe only the test layer (keeps prelude state, used per-test)
 #
 # Usage:
-#   overlay.sh init    <snapshot_dir> <overlay_root>   # create dirs (idempotent)
-#   overlay.sh mount   <snapshot_dir> <overlay_root>   # mount overlay if not mounted
-#   overlay.sh umount  <overlay_root>                  # umount if mounted
-#   overlay.sh wipe    <overlay_root>                  # rm -rf upper/* work/* (must be unmounted)
-#   overlay.sh reset   <snapshot_dir> <overlay_root>   # umount + wipe + mount (the sweep entrypoint)
-#   overlay.sh status  <overlay_root>                  # print mounted? + sizes
+#   overlay.sh init       <snapshot_dir> <overlay_root>
+#   overlay.sh mount-all  <snapshot_dir> <overlay_root>
+#   overlay.sh umount-all <overlay_root>
+#   overlay.sh reset-all  <snapshot_dir> <overlay_root>
+#   overlay.sh reset-test <snapshot_dir> <overlay_root>
+#   overlay.sh status     <overlay_root>
+#
+# Backwards-compat aliases (single-layer naming from earlier version):
+#   overlay.sh mount   <snapshot_dir> <overlay_root>   = mount-all
+#   overlay.sh umount  <overlay_root>                  = umount-all
+#   overlay.sh reset   <snapshot_dir> <overlay_root>   = reset-all
 #
 # Designed to be the single sudo entrypoint, e.g. via:
 #   /etc/sudoers.d/besu-bench:
-#     ubuntu ALL=(root) NOPASSWD: /opt/besu-bench/overlay.sh
+#     <user> ALL=(root) NOPASSWD: /usr/local/sbin/besu-overlay.sh
 set -euo pipefail
 
 die() { echo "overlay.sh: $*" >&2; exit 1; }
@@ -29,93 +39,144 @@ require_abs() {
     esac
 }
 
-is_mounted() {
-    local merged="$1"
-    mountpoint -q "$merged"
-}
+is_mounted() { mountpoint -q "$1"; }
 
 cmd_init() {
     local snapshot="$1" root="$2"
     require_abs "$snapshot"; require_abs "$root"
     [[ -d "$snapshot" ]] || die "snapshot dir not found: $snapshot"
-    mkdir -p "$root/upper" "$root/work" "$root/merged"
-    chmod 755 "$root" "$root/upper" "$root/work" "$root/merged"
+    mkdir -p "$root/prelude/upper" "$root/prelude/work" "$root/prelude/merged" \
+             "$root/test/upper"    "$root/test/work"    "$root/test/merged"
+    chmod 755 "$root" \
+              "$root/prelude" "$root/prelude/upper" "$root/prelude/work" "$root/prelude/merged" \
+              "$root/test"    "$root/test/upper"    "$root/test/work"    "$root/test/merged"
 }
 
-cmd_mount() {
+mount_prelude() {
     local snapshot="$1" root="$2"
-    require_abs "$snapshot"; require_abs "$root"
-    [[ -d "$snapshot" ]] || die "snapshot dir not found: $snapshot"
-    cmd_init "$snapshot" "$root"
-    if is_mounted "$root/merged"; then
-        echo "overlay.sh: already mounted at $root/merged"
+    if is_mounted "$root/prelude/merged"; then
+        echo "overlay.sh: prelude already mounted at $root/prelude/merged"
         return 0
     fi
     mount -t overlay overlay \
-        -o "lowerdir=$snapshot,upperdir=$root/upper,workdir=$root/work" \
-        "$root/merged"
-    echo "overlay.sh: mounted $root/merged (lower=$snapshot)"
+        -o "lowerdir=$snapshot,upperdir=$root/prelude/upper,workdir=$root/prelude/work" \
+        "$root/prelude/merged"
+    echo "overlay.sh: mounted prelude at $root/prelude/merged (lower=$snapshot)"
 }
 
-cmd_umount() {
+mount_test() {
     local root="$1"
-    require_abs "$root"
-    if is_mounted "$root/merged"; then
-        umount "$root/merged"
-        echo "overlay.sh: unmounted $root/merged"
-    else
-        echo "overlay.sh: $root/merged not mounted"
+    is_mounted "$root/prelude/merged" || die "prelude must be mounted before test layer"
+    if is_mounted "$root/test/merged"; then
+        echo "overlay.sh: test already mounted at $root/test/merged"
+        return 0
+    fi
+    mount -t overlay overlay \
+        -o "lowerdir=$root/prelude/merged,upperdir=$root/test/upper,workdir=$root/test/work" \
+        "$root/test/merged"
+    echo "overlay.sh: mounted test at $root/test/merged (lower=$root/prelude/merged)"
+}
+
+umount_test() {
+    local root="$1"
+    if is_mounted "$root/test/merged"; then
+        umount "$root/test/merged"
+        echo "overlay.sh: unmounted $root/test/merged"
     fi
 }
 
-cmd_wipe() {
+umount_prelude() {
     local root="$1"
-    require_abs "$root"
-    if is_mounted "$root/merged"; then
-        die "refusing to wipe while mounted: $root/merged"
+    if is_mounted "$root/prelude/merged"; then
+        umount "$root/prelude/merged"
+        echo "overlay.sh: unmounted $root/prelude/merged"
     fi
-    # Belt-and-braces: only touch the two scratch subdirs.
-    [[ -d "$root/upper" ]] && find "$root/upper" -mindepth 1 -delete
-    [[ -d "$root/work"  ]] && find "$root/work"  -mindepth 1 -delete
-    echo "overlay.sh: wiped $root/upper and $root/work"
 }
 
-cmd_reset() {
+wipe_test() {
+    local root="$1"
+    is_mounted "$root/test/merged" && die "refusing to wipe while mounted: $root/test/merged"
+    [[ -d "$root/test/upper" ]] && find "$root/test/upper" -mindepth 1 -delete
+    [[ -d "$root/test/work"  ]] && find "$root/test/work"  -mindepth 1 -delete
+    echo "overlay.sh: wiped $root/test/upper and $root/test/work"
+}
+
+wipe_prelude() {
+    local root="$1"
+    is_mounted "$root/prelude/merged" && die "refusing to wipe while mounted: $root/prelude/merged"
+    [[ -d "$root/prelude/upper" ]] && find "$root/prelude/upper" -mindepth 1 -delete
+    [[ -d "$root/prelude/work"  ]] && find "$root/prelude/work"  -mindepth 1 -delete
+    echo "overlay.sh: wiped $root/prelude/upper and $root/prelude/work"
+}
+
+cmd_mount_all() {
     local snapshot="$1" root="$2"
     require_abs "$snapshot"; require_abs "$root"
-    cmd_umount "$root" || true
-    cmd_wipe "$root"
-    cmd_mount "$snapshot" "$root"
+    cmd_init "$snapshot" "$root"
+    mount_prelude "$snapshot" "$root"
+    mount_test "$root"
+}
+
+cmd_umount_all() {
+    local root="$1"
+    require_abs "$root"
+    umount_test "$root"
+    umount_prelude "$root"
+}
+
+cmd_reset_all() {
+    local snapshot="$1" root="$2"
+    require_abs "$snapshot"; require_abs "$root"
+    cmd_init "$snapshot" "$root"
+    umount_test "$root"
+    umount_prelude "$root"
+    wipe_test "$root"
+    wipe_prelude "$root"
+    mount_prelude "$snapshot" "$root"
+    mount_test "$root"
+}
+
+cmd_reset_test() {
+    local snapshot="$1" root="$2"
+    require_abs "$snapshot"; require_abs "$root"
+    cmd_init "$snapshot" "$root"
+    # Make sure the prelude layer is still mounted; do NOT touch its writes.
+    if ! is_mounted "$root/prelude/merged"; then
+        mount_prelude "$snapshot" "$root"
+    fi
+    umount_test "$root"
+    wipe_test "$root"
+    mount_test "$root"
 }
 
 cmd_status() {
     local root="$1"
     require_abs "$root"
-    if is_mounted "$root/merged"; then
-        echo "mounted: yes ($root/merged)"
-    else
-        echo "mounted: no  ($root/merged)"
-    fi
-    if [[ -d "$root/upper" ]]; then
-        echo -n "upper size: "; du -sh "$root/upper" 2>/dev/null | awk '{print $1}'
-    fi
-    if [[ -d "$root/work" ]]; then
-        echo -n "work size:  "; du -sh "$root/work" 2>/dev/null | awk '{print $1}'
-    fi
+    for layer in prelude test; do
+        if is_mounted "$root/$layer/merged"; then
+            echo "$layer: mounted ($root/$layer/merged)"
+        else
+            echo "$layer: not mounted"
+        fi
+        if [[ -d "$root/$layer/upper" ]]; then
+            echo -n "  upper size: "; du -sh "$root/$layer/upper" 2>/dev/null | awk '{print $1}'
+        fi
+    done
 }
 
 main() {
     local action="${1:-}"; shift || true
     case "$action" in
-        init)    [[ $# -eq 2 ]] || die "usage: $0 init <snapshot_dir> <overlay_root>";   cmd_init   "$1" "$2" ;;
-        mount)   [[ $# -eq 2 ]] || die "usage: $0 mount <snapshot_dir> <overlay_root>";  cmd_mount  "$1" "$2" ;;
-        umount)  [[ $# -eq 1 ]] || die "usage: $0 umount <overlay_root>";                cmd_umount "$1" ;;
-        wipe)    [[ $# -eq 1 ]] || die "usage: $0 wipe <overlay_root>";                  cmd_wipe   "$1" ;;
-        reset)   [[ $# -eq 2 ]] || die "usage: $0 reset <snapshot_dir> <overlay_root>";  cmd_reset  "$1" "$2" ;;
-        status)  [[ $# -eq 1 ]] || die "usage: $0 status <overlay_root>";                cmd_status "$1" ;;
-        ""|-h|--help|help)
-            sed -n '2,18p' "$0"
-            ;;
+        init)        [[ $# -eq 2 ]] || die "usage: $0 init <snapshot> <root>";        cmd_init       "$1" "$2" ;;
+        mount-all|mount)
+                     [[ $# -eq 2 ]] || die "usage: $0 mount-all <snapshot> <root>";   cmd_mount_all  "$1" "$2" ;;
+        umount-all|umount)
+                     [[ $# -eq 1 ]] || die "usage: $0 umount-all <root>";             cmd_umount_all "$1" ;;
+        reset-all|reset)
+                     [[ $# -eq 2 ]] || die "usage: $0 reset-all <snapshot> <root>";   cmd_reset_all  "$1" "$2" ;;
+        reset-test)  [[ $# -eq 2 ]] || die "usage: $0 reset-test <snapshot> <root>";  cmd_reset_test "$1" "$2" ;;
+        status)      [[ $# -eq 1 ]] || die "usage: $0 status <root>";                 cmd_status     "$1" ;;
+        ""|-h|--help|help) sed -n '2,28p' "$0" ;;
         *) die "unknown action: $action (try --help)" ;;
     esac
 }

@@ -4,6 +4,14 @@
 Boots a Besu container against an OverlayFS-mounted snapshot and replays
 JSON-RPC newPayload/forkchoiceUpdated lines through the Engine API.
 
+Two isolation modes (run.isolation):
+  * sweep   - reset overlay once per invocation, then run prelude + all tests
+              sequentially in one Besu process. Fastest, no per-test isolation.
+  * restart - reset overlay once, run prelude, then per test:
+              stop Besu -> wipe ONLY the test layer (preserves prelude
+              writes via two-layer overlay) -> start Besu -> run setup+test.
+              Strongest isolation; cost ~= one docker restart per test.
+
 Usage:
     python3 run.py --config config.yaml [--filter '*BALANCE*'] [--dry-run]
 
@@ -24,7 +32,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
 
 import jwt
 import requests
@@ -44,7 +51,9 @@ class BesuConfig:
     jwt_secret_path: Path
     engine_url: str
     extra_args: list[str]
+    extra_mounts: list[str]
     startup_timeout_s: int
+    container_data_path: str
 
 
 @dataclasses.dataclass
@@ -68,6 +77,7 @@ class RunConfig:
     request_timeout_s: int
     fail_fast: bool
     stop_container_on_exit: bool
+    isolation: str  # sweep | restart
 
 
 @dataclasses.dataclass
@@ -78,6 +88,9 @@ class Config:
     run: RunConfig
 
 
+_VALID_ISOLATION = {"sweep", "restart"}
+
+
 def _abs_path(p: str | os.PathLike) -> Path:
     return Path(p).expanduser().resolve()
 
@@ -85,6 +98,9 @@ def _abs_path(p: str | os.PathLike) -> Path:
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text())
     b, i, t, r = raw["besu"], raw["input"], raw["tests"], raw["run"]
+    isolation = str(r.get("isolation", "sweep")).lower()
+    if isolation not in _VALID_ISOLATION:
+        raise ValueError(f"run.isolation must be one of {_VALID_ISOLATION}, got {isolation!r}")
     return Config(
         besu=BesuConfig(
             image=b["image"],
@@ -94,7 +110,9 @@ def load_config(path: Path) -> Config:
             jwt_secret_path=_abs_path(b["jwt_secret_path"]),
             engine_url=b["engine_url"].rstrip("/"),
             extra_args=list(b.get("extra_args") or []),
+            extra_mounts=list(b.get("extra_mounts") or []),
             startup_timeout_s=int(b.get("startup_timeout_s", 120)),
+            container_data_path=str(b.get("container_data_path", "/opt/besu/data")),
         ),
         input=InputConfig(
             dir=_abs_path(i["dir"]),
@@ -112,6 +130,7 @@ def load_config(path: Path) -> Config:
             request_timeout_s=int(r.get("request_timeout_s", 120)),
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
+            isolation=isolation,
         ),
     )
 
@@ -207,21 +226,20 @@ def stop_container(name: str) -> None:
 
 def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     stop_container(cfg.container_name)
-    merged = cfg.overlay_dir / "merged"
-    docker_cmd = [
+    # The container always sees the test-layer merged dir. Underneath it is
+    # the prelude layer (if isolation != sweep) or just the snapshot.
+    merged = cfg.overlay_dir / "test" / "merged"
+    docker_cmd: list[str] = [
         "docker", "run", "-d", "--rm",
         "--name", cfg.container_name,
         "--network", "host",
-        "-v", f"{merged}:/opt/besu/data",
-        "-v", f"{cfg.jwt_secret_path}:/etc/besu/jwt.hex:ro",
-        cfg.image,
-        "--data-path=/opt/besu/data",
-        "--engine-rpc-enabled=true",
-        "--engine-host-allowlist=*",
-        f"--engine-jwt-secret-file=/etc/besu/jwt.hex",
-        "--engine-rpc-port=8551",
-        *cfg.extra_args,
+        "-v", f"{merged}:{cfg.container_data_path}",
     ]
+    for spec in cfg.extra_mounts:
+        docker_cmd += ["-v", spec]
+    docker_cmd.append(cfg.image)
+    docker_cmd.append(f"--data-path={cfg.container_data_path}")
+    docker_cmd += cfg.extra_args
     log.event("docker run: " + " ".join(shlex.quote(a) for a in docker_cmd))
     _run(docker_cmd, capture=True)
 
@@ -233,18 +251,27 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
 OVERLAY_SCRIPT = Path(__file__).resolve().parent / "scripts" / "overlay.sh"
 
 
-def overlay_reset(cfg: BesuConfig, log: SweepLog) -> None:
-    cmd = ["sudo", "-n", str(OVERLAY_SCRIPT), "reset",
-           str(cfg.data_snapshot_dir), str(cfg.overlay_dir)]
-    log.event("overlay reset: " + " ".join(shlex.quote(a) for a in cmd))
+def _overlay(action: str, cfg: BesuConfig, log: SweepLog, *extra_args: str) -> None:
+    cmd = ["sudo", "-n", str(OVERLAY_SCRIPT), action]
+    if action in ("init", "mount-all", "reset-all", "reset-test"):
+        cmd += [str(cfg.data_snapshot_dir), str(cfg.overlay_dir)]
+    else:
+        cmd += [str(cfg.overlay_dir)]
+    cmd += list(extra_args)
+    log.event(f"overlay {action}: " + " ".join(shlex.quote(a) for a in cmd))
     _run(cmd)
 
 
-def overlay_init(cfg: BesuConfig, log: SweepLog) -> None:
-    cmd = ["sudo", "-n", str(OVERLAY_SCRIPT), "mount",
-           str(cfg.data_snapshot_dir), str(cfg.overlay_dir)]
-    log.event("overlay mount (no reset): " + " ".join(shlex.quote(a) for a in cmd))
-    _run(cmd)
+def overlay_reset_all(cfg: BesuConfig, log: SweepLog) -> None:
+    _overlay("reset-all", cfg, log)
+
+
+def overlay_mount_all(cfg: BesuConfig, log: SweepLog) -> None:
+    _overlay("mount-all", cfg, log)
+
+
+def overlay_reset_test(cfg: BesuConfig, log: SweepLog) -> None:
+    _overlay("reset-test", cfg, log)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +343,32 @@ def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
     return True, "", {}
 
 
+def post_engine_line(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    raw: str,
+) -> tuple[int, dict | None, str | None]:
+    """Low-level POST. Returns (http_status, json_body, transport_error_repr)."""
+    try:
+        resp = session.post(
+            cfg.besu.engine_url,
+            data=raw,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {make_jwt(secret)}",
+            },
+            timeout=cfg.run.request_timeout_s,
+        )
+    except requests.RequestException as e:
+        return -1, None, repr(e)
+    try:
+        body = resp.json()
+    except ValueError as e:
+        return resp.status_code, None, f"bad_json:{e!r}:{resp.text[:200]}"
+    return resp.status_code, body, None
+
+
 def replay_file(
     cfg: Config,
     secret: bytes,
@@ -339,41 +392,21 @@ def replay_file(
                     return False
                 continue
 
-            try:
-                resp = session.post(
-                    cfg.besu.engine_url,
-                    data=raw,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {make_jwt(secret)}",
-                    },
-                    timeout=cfg.run.request_timeout_s,
-                )
-            except requests.RequestException as e:
-                log.record_fail(label, line_no, "http_error", {"method": method, "error": repr(e)})
+            status, body, err = post_engine_line(cfg, secret, session, raw)
+            if err is not None and body is None:
+                log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
+                if cfg.run.fail_fast:
+                    return False
+                continue
+            if status != 200:
+                log.record_fail(label, line_no, "http_status",
+                                {"method": method, "status": status,
+                                 "body": json.dumps(body) if body is not None else err})
                 if cfg.run.fail_fast:
                     return False
                 continue
 
-            if resp.status_code != 200:
-                log.record_fail(
-                    label, line_no, "http_status",
-                    {"method": method, "status": resp.status_code, "body": resp.text[:500]},
-                )
-                if cfg.run.fail_fast:
-                    return False
-                continue
-
-            try:
-                body = resp.json()
-            except ValueError as e:
-                log.record_fail(label, line_no, "bad_json_response",
-                                {"method": method, "error": repr(e), "body": resp.text[:500]})
-                if cfg.run.fail_fast:
-                    return False
-                continue
-
-            ok, kind, detail = _classify(method, body)
+            ok, kind, detail = _classify(method, body or {})
             if ok:
                 log.record_ok(label)
             else:
@@ -412,7 +445,6 @@ def discover_tests(cfg: Config, filter_override: str | None) -> list[str]:
     if order == "alphabetical":
         pass
     elif order == "as_listed":
-        # Preserve filesystem listing order from setup_dir.
         listing = [p.name for p in setup_dir.iterdir() if p.is_file()]
         order_index = {n: i for i, n in enumerate(listing)}
         matched.sort(key=lambda n: order_index.get(n, 0))
@@ -427,11 +459,22 @@ def discover_tests(cfg: Config, filter_override: str | None) -> list[str]:
 # Sweep orchestration
 # ---------------------------------------------------------------------------
 
+def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
+                   setup_dir: Path, testing_dir: Path, name: str, log: SweepLog) -> bool:
+    if not replay_file(cfg, secret, session, setup_dir / name, log):
+        log.event(f"fail-fast tripped during setup of {name}")
+        return False
+    if not replay_file(cfg, secret, session, testing_dir / name, log):
+        log.event(f"fail-fast tripped during testing of {name}")
+        return False
+    return True
+
+
 def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
-    log.event(f"sweep start, log dir = {log_root}")
+    log.event(f"sweep start, log dir = {log_root}, isolation = {cfg.run.isolation}")
 
     tests = discover_tests(cfg, filter_override)
     log.event(f"matched {len(tests)} tests (filter={filter_override or cfg.tests.filter}, order={cfg.tests.order})")
@@ -443,7 +486,6 @@ def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
         log.close()
         return 0
 
-    # Validate inputs exist before touching the system.
     for name in cfg.input.prelude:
         p = cfg.input.dir / name
         if not p.is_file():
@@ -452,39 +494,50 @@ def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
         raise FileNotFoundError(f"jwt secret missing: {cfg.besu.jwt_secret_path}")
 
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    setup_dir = cfg.input.dir / cfg.tests.setup_subdir
+    testing_dir = cfg.input.dir / cfg.tests.testing_subdir
 
     started_container = False
     sweep_ok = True
+
     try:
         if cfg.run.reset_overlay:
-            overlay_reset(cfg.besu, log)
+            overlay_reset_all(cfg.besu, log)
         else:
-            overlay_init(cfg.besu, log)
+            overlay_mount_all(cfg.besu, log)
 
         start_besu(cfg.besu, log)
         started_container = True
         wait_for_engine(cfg.besu, secret, log)
 
         with requests.Session() as session:
+            # Phase 1: prelude (always runs once, in this Besu instance).
             for name in cfg.input.prelude:
                 if not replay_file(cfg, secret, session, cfg.input.dir / name, log):
                     sweep_ok = False
                     log.event(f"fail-fast tripped during prelude {name}")
                     break
 
-            if sweep_ok:
-                setup_dir = cfg.input.dir / cfg.tests.setup_subdir
-                testing_dir = cfg.input.dir / cfg.tests.testing_subdir
+            if not sweep_ok:
+                pass
+            elif cfg.run.isolation == "sweep":
+                # All tests in one Besu, no per-test reset.
                 for idx, name in enumerate(tests, start=1):
                     log.event(f"[{idx}/{len(tests)}] {name}")
-                    if not replay_file(cfg, secret, session, setup_dir / name, log):
+                    if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
                         sweep_ok = False
-                        log.event(f"fail-fast tripped during setup of {name}")
                         break
-                    if not replay_file(cfg, secret, session, testing_dir / name, log):
-                        sweep_ok = False
-                        log.event(f"fail-fast tripped during testing of {name}")
-                        break
+
+            elif cfg.run.isolation == "restart":
+                # Per test: stop besu, reset only the test layer, start besu, run pair.
+                for idx, name in enumerate(tests, start=1):
+                    log.event(f"[{idx}/{len(tests)}] {name}")
+                    stop_container(cfg.besu.container_name)
+                    overlay_reset_test(cfg.besu, log)
+                    start_besu(cfg.besu, log)
+                    wait_for_engine(cfg.besu, secret, log)
+                    if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
+                        sweep_ok = False; break
 
         log.event(f"sweep end: ok={sweep_ok}")
     finally:
@@ -495,6 +548,7 @@ def run_sweep(cfg: Config, filter_override: str | None, dry_run: bool) -> int:
                 "input_dir": str(cfg.input.dir),
                 "filter": filter_override or cfg.tests.filter,
                 "order": cfg.tests.order,
+                "isolation": cfg.run.isolation,
                 "selected_tests": len(tests),
             },
             "fail_fast_tripped": not sweep_ok,
@@ -516,6 +570,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--config", "-c", default="config.yaml", help="path to YAML config")
     p.add_argument("--filter", "-f", default=None,
                    help="override tests.filter glob (e.g. '*BALANCE*30M*')")
+    p.add_argument("--isolation", choices=sorted(_VALID_ISOLATION), default=None,
+                   help="override run.isolation (sweep | restart)")
     p.add_argument("--dry-run", action="store_true",
                    help="resolve config + selected tests, then exit without touching the system")
     return p.parse_args(argv)
@@ -531,6 +587,8 @@ def _install_sigint_handler() -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = load_config(_abs_path(args.config))
+    if args.isolation is not None:
+        cfg = dataclasses.replace(cfg, run=dataclasses.replace(cfg.run, isolation=args.isolation))
     _install_sigint_handler()
     return run_sweep(cfg, filter_override=args.filter, dry_run=args.dry_run)
 
