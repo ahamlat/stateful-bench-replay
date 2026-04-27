@@ -220,6 +220,30 @@ def _container_exists(name: str) -> bool:
     return name in res.stdout.split()
 
 
+def _container_running(name: str) -> bool:
+    res = _run(
+        ["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+        capture=True,
+    )
+    return name in res.stdout.split()
+
+
+def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> None:
+    if not _container_exists(name):
+        log.event(f"container {name} no longer exists; cannot dump logs")
+        return
+    res = _run(
+        ["docker", "logs", "--tail", str(tail), name],
+        check=False,
+        capture=True,
+    )
+    out = (res.stdout or "") + (res.stderr or "")
+    log.event(f"--- last {tail} lines of `docker logs {name}` ---")
+    for line in out.splitlines():
+        log.event(f"  | {line}")
+    log.event("--- end of container logs ---")
+
+
 def stop_container(name: str) -> None:
     if not _container_exists(name):
         return
@@ -232,8 +256,11 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     # stacks on top of the prelude layer, which itself stacks on the
     # read-only snapshot.
     merged = cfg.overlay_dir / "test" / "merged"
+    # NOTE: no --rm here. We want the container to stick around if Besu
+    # crashes, so wait_for_engine can dump `docker logs` on failure.
+    # stop_container() above and at end-of-test cleans it up.
     docker_cmd: list[str] = [
-        "docker", "run", "-d", "--rm",
+        "docker", "run", "-d",
         "--name", cfg.container_name,
         "--network", "host",
         "-v", f"{merged}:{cfg.container_data_path}",
@@ -316,6 +343,13 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
     log.event(f"waiting for Engine API at {cfg.engine_url} (timeout {cfg.startup_timeout_s}s)")
     last_err: str | None = None
     while time.monotonic() < deadline:
+        if not _container_running(cfg.container_name):
+            log.event(f"container {cfg.container_name} exited before Engine API came up")
+            _dump_container_logs(cfg.container_name, log)
+            raise RuntimeError(
+                f"Besu container {cfg.container_name} exited during startup; "
+                "see container logs above (also in events.log)"
+            )
         try:
             r = requests.post(
                 cfg.engine_url,
@@ -333,7 +367,11 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
         except (requests.RequestException, ValueError) as e:
             last_err = repr(e)
         time.sleep(2)
-    raise RuntimeError(f"Engine API did not become ready in {cfg.startup_timeout_s}s; last error: {last_err}")
+    _dump_container_logs(cfg.container_name, log)
+    raise RuntimeError(
+        f"Engine API did not become ready in {cfg.startup_timeout_s}s; "
+        f"last error: {last_err} (see container logs above)"
+    )
 
 
 # Statuses that count as success per Engine API spec.
