@@ -258,6 +258,19 @@ def stop_container(name: str) -> None:
     _run(DOCKER + ["rm", "-f", name], check=False, capture=True)
 
 
+def save_container_logs(name: str, dest: Path, log: SweepLog) -> None:
+    """Save the full container log to `dest` before we tear the container
+    down. Done with `docker logs` (no --tail) so the file is canonical."""
+    if not _container_exists(name):
+        log.event(f"save_container_logs: {name} no longer exists, skipping")
+        return
+    res = _run(DOCKER + ["logs", name], check=False, capture=True)
+    out = (res.stdout or "") + (res.stderr or "")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(out)
+    log.event(f"saved {len(out.splitlines())} log lines to {dest}")
+
+
 def start_besu(cfg: BesuConfig, log: SweepLog, *, layer: str = "test") -> None:
     """Boot Besu with its data-path bound to one of the two overlay layers.
 
@@ -400,6 +413,54 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
 # bugs (e.g. wrong overlay layer => prelude state missing).
 _NEWPAYLOAD_OK = {"VALID"}
 _FCU_OK = {"VALID"}
+
+
+def _rpc_http_url(cfg: BesuConfig) -> str:
+    """Best-effort: derive the unauthenticated JSON-RPC URL from extra_args.
+    Falls back to http://127.0.0.1:8545."""
+    port = "8545"
+    for a in cfg.extra_args:
+        if a.startswith("--rpc-http-port="):
+            port = a.split("=", 1)[1]
+    return f"http://127.0.0.1:{port}"
+
+
+def query_chain_head(cfg: BesuConfig) -> tuple[int, str] | None:
+    """Ask Besu for its current chain head over the unauthenticated JSON-RPC
+    port. Returns (block_number, block_hash) or None on error.
+
+    Note: we use the plain RPC port here (not the Engine API) because it
+    needs no JWT and serves the same chain view.
+    """
+    url = _rpc_http_url(cfg)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBlockByNumber",
+        "params": ["latest", False],
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        result = body.get("result") or {}
+        num_hex = result.get("number")
+        h = result.get("hash")
+        if not num_hex or not h:
+            return None
+        return int(num_hex, 16), h
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def log_chain_head(cfg: BesuConfig, log: SweepLog, prefix: str) -> None:
+    head = query_chain_head(cfg)
+    if head is None:
+        log.event(f"{prefix}: could not read chain head over RPC")
+    else:
+        n, h = head
+        log.event(f"{prefix}: head = #{n:,} ({h})")
 
 
 def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
@@ -671,6 +732,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
         start_besu(cfg.besu, log, layer="prelude")
         started_container = True
         wait_for_engine(cfg.besu, secret, log)
+        log_chain_head(cfg.besu, log, "prelude container booted, head BEFORE replay")
 
         with requests.Session() as session:
             # Phase 1: prelude (always runs once, in this Besu instance).
@@ -683,6 +745,11 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
             # Phase 2: per-test loop. Each test runs in a fresh Besu against
             # a wiped test overlay layer (prelude state is preserved).
             if sweep_ok:
+                log_chain_head(cfg.besu, log, "prelude replay complete, head AFTER prelude")
+                # Persist the prelude container's full log before we kill it.
+                save_container_logs(
+                    cfg.besu.container_name, log.root / "besu-prelude.log", log
+                )
                 # Stop the prelude-running Besu before the first per-test reset.
                 stop_container(cfg.besu.container_name)
                 for idx, name in enumerate(tests, start=1):
@@ -692,9 +759,28 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     # gets wiped on the next reset-test).
                     start_besu(cfg.besu, log, layer="test")
                     wait_for_engine(cfg.besu, secret, log)
+                    log_chain_head(
+                        cfg.besu, log,
+                        f"test container booted ({idx}/{len(tests)}), head BEFORE replay"
+                    )
                     if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
                         sweep_ok = False
+                        # Save logs for the failing test before tearing down.
+                        save_container_logs(
+                            cfg.besu.container_name,
+                            log.root / f"besu-test-{idx:04d}-FAIL.log",
+                            log,
+                        )
                         break
+                    log_chain_head(
+                        cfg.besu, log,
+                        f"test {idx}/{len(tests)} done, head AFTER replay"
+                    )
+                    save_container_logs(
+                        cfg.besu.container_name,
+                        log.root / f"besu-test-{idx:04d}.log",
+                        log,
+                    )
                     stop_container(cfg.besu.container_name)
 
         log.event(f"sweep end: ok={sweep_ok}")
