@@ -69,44 +69,41 @@ up with `besu.extra_mounts`.
 Tested layout: Ubuntu 22.04+ or Amazon Linux 2023, x86_64, snapshot disk
 mounted at `/data`, snapshot directory at `/data/besu`.
 
+The runner is intentionally **sudo-driven**: every privileged call
+(`docker`, `overlay.sh`) goes through `sudo -n`. You do **not** need to
+join the `docker` group, and we don't install anything under `/opt`.
+
 ```bash
-# 1. Docker
-sudo apt-get update && sudo apt-get install -y docker.io python3-pip rsync openssl
+# 1. Packages
+sudo apt-get update
+sudo apt-get install -y docker.io python3-venv python3-pip rsync openssl
 sudo systemctl enable --now docker
-sudo usermod -aG docker "$USER"
-newgrp docker     # or log out / log back in
 
-# 2. Python deps (use a venv if you prefer)
-python3 -m pip install --user -r requirements.txt
+# 2. JWT secret + genesis file (must already exist where config.yaml points)
+ls -lh /data/jwt.hex                                                          # already provisioned in your setup
+ls -lh ~/stateful-bench-replay/genesis-perf-devnet-3-24358000-amsterdam-besu.json
 
-# 3. JWT secret shared by Besu and the runner
-#    The runner reads it from besu.jwt_secret_path (default /tmp/jwtsecret in
-#    config.example.yaml) and bind-mounts it into the container via
-#    besu.extra_mounts. The path here just has to match what you put in YAML.
-openssl rand -hex 32 | sudo tee /tmp/jwtsecret >/dev/null
-sudo chmod 644 /tmp/jwtsecret
-
-# Place your genesis file too if besu.extra_args references one
-# (the example uses --genesis-file=/tmp/genesis.json):
-# sudo cp /path/to/genesis.json /tmp/genesis.json && sudo chmod 644 /tmp/genesis.json
-
-# 4. Overlay scratch dirs (one-time; reset/mount happen per sweep).
-#    The runner / overlay.sh will recreate these if missing, but pre-creating
-#    saves a sudo prompt on first run.
+# 3. Overlay scratch dirs (the helper recreates them if missing).
 sudo mkdir -p /data/besu-overlay/{prelude,test}/{upper,work,merged}
 
-# 5. Install the overlay helper somewhere stable and allowlist it via sudoers
-sudo install -m 0755 scripts/overlay.sh /opt/besu-bench/overlay.sh
-echo "$USER ALL=(root) NOPASSWD: /opt/besu-bench/overlay.sh" \
-    | sudo tee /etc/sudoers.d/besu-bench
+# 4. Allowlist BOTH commands the runner shells out to, passwordless.
+#    (The runner uses `sudo -n` so a missing entry fails fast instead of
+#    prompting in the middle of a sweep.)
+sudo tee /etc/sudoers.d/besu-bench >/dev/null <<EOF
+$USER ALL=(root) NOPASSWD: /home/$USER/stateful-bench-replay/scripts/overlay.sh
+$USER ALL=(root) NOPASSWD: /usr/bin/docker
+EOF
 sudo chmod 440 /etc/sudoers.d/besu-bench
+
+# 5. Sanity check
+sudo -n docker version --format '{{.Server.Version}}'
+sudo -n /home/$USER/stateful-bench-replay/scripts/overlay.sh --help | head -3
 ```
 
-If you prefer to keep the helper inside the repo checkout, point the sudoers
-line at its absolute path instead of `/opt/besu-bench/overlay.sh`. The
-`run.py` script invokes the copy that sits next to it
-(`bench/stateful-replay/scripts/overlay.sh`) by default; symlink or replace
-that path to match whatever you allowlisted in sudoers.
+If `docker` lives somewhere other than `/usr/bin/docker` on your distro,
+adjust the second sudoers line accordingly (`command -v docker` will tell
+you). The runner does not install anything under `/opt`, and pulling
+updates is just `git pull` in your checkout.
 
 ### Sync test inputs
 
@@ -187,18 +184,16 @@ If `runs/<ts>/failures.jsonl` is empty, every replayed line returned
 
 ## Operational notes
 
-- `run.py` runs `sudo -n scripts/overlay.sh reset-all ...` at the start of
-  each sweep and `sudo -n scripts/overlay.sh reset-test ...` between tests.
-  The `-n` flag means the call must not prompt; that's why the sudoers
-  allowlist above is required.
-- If you see `overlay.sh: unknown action: reset-all` (or `reset-test` /
-  `mount-all`) the helper installed at the sudoers-allowlisted path is an
-  older single-layer version. Re-run the install step to refresh it:
-
-  ```bash
-  sudo install -m 0755 scripts/overlay.sh /usr/local/sbin/besu-overlay.sh
-  ln -sf /usr/local/sbin/besu-overlay.sh scripts/overlay.sh
-  ```
+- `run.py` shells out to `sudo -n docker ...` for every container call and
+  to `sudo -n scripts/overlay.sh reset-all/reset-test ...` for every
+  filesystem call. The `-n` flag means none of them is allowed to prompt;
+  that's why both must be in the sudoers allowlist (see bootstrap step 4).
+- If a sweep aborts immediately with `sudo -n docker version failed`, your
+  user can't run `sudo docker` non-interactively yet. Re-do step 4 of the
+  bootstrap and re-check with `sudo -n docker version`.
+- If overlay.sh rejects an action with `unknown action: reset-all`, your
+  checkout is on an older single-layer version of the script — `git pull`
+  then re-run.
 - The Besu container is started with `--network host` so the runner can hit
   `127.0.0.1:8551` directly. Change `besu.engine_url` and drop `--network
   host` from `start_besu` in `run.py` if you need port mapping instead.

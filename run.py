@@ -212,9 +212,15 @@ def _run(cmd: list[str], check: bool = True, capture: bool = False) -> subproces
     return subprocess.run(cmd, check=check)
 
 
+# Always invoke docker via passwordless sudo. This avoids relying on docker
+# group membership and matches the project's "everything privileged goes
+# through sudoers NOPASSWD" model (overlay.sh + docker).
+DOCKER = ["sudo", "-n", "docker"]
+
+
 def _container_exists(name: str) -> bool:
     res = _run(
-        ["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+        DOCKER + ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
         capture=True,
     )
     return name in res.stdout.split()
@@ -222,7 +228,7 @@ def _container_exists(name: str) -> bool:
 
 def _container_running(name: str) -> bool:
     res = _run(
-        ["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+        DOCKER + ["ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
         capture=True,
     )
     return name in res.stdout.split()
@@ -233,12 +239,12 @@ def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> None:
         log.event(f"container {name} no longer exists; cannot dump logs")
         return
     res = _run(
-        ["docker", "logs", "--tail", str(tail), name],
+        DOCKER + ["logs", "--tail", str(tail), name],
         check=False,
         capture=True,
     )
     out = (res.stdout or "") + (res.stderr or "")
-    log.event(f"--- last {tail} lines of `docker logs {name}` ---")
+    log.event(f"--- last {tail} lines of `sudo docker logs {name}` ---")
     for line in out.splitlines():
         log.event(f"  | {line}")
     log.event("--- end of container logs ---")
@@ -247,7 +253,7 @@ def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> None:
 def stop_container(name: str) -> None:
     if not _container_exists(name):
         return
-    _run(["docker", "rm", "-f", name], check=False, capture=True)
+    _run(DOCKER + ["rm", "-f", name], check=False, capture=True)
 
 
 def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
@@ -259,8 +265,8 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     # NOTE: no --rm here. We want the container to stick around if Besu
     # crashes, so wait_for_engine can dump `docker logs` on failure.
     # stop_container() above and at end-of-test cleans it up.
-    docker_cmd: list[str] = [
-        "docker", "run", "-d",
+    docker_cmd: list[str] = list(DOCKER) + [
+        "run", "-d",
         "--name", cfg.container_name,
         "--network", "host",
         "-v", f"{merged}:{cfg.container_data_path}",
@@ -568,6 +574,22 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None, dry_r
                 "config: a missing host path makes docker silently create an "
                 "empty directory and Besu will fail to start with no logs."
             )
+
+    # Preflight: passwordless sudo for both helpers we depend on.
+    for probe, hint in (
+        (DOCKER + ["version", "--format", "{{.Server.Version}}"],
+         "sudo -n docker version"),
+        (["sudo", "-n", str(OVERLAY_SCRIPT), "--help"],
+         f"sudo -n {OVERLAY_SCRIPT} --help"),
+    ):
+        try:
+            _run(probe, capture=True)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            raise RuntimeError(
+                f"`{hint}` failed with exit {e.returncode}: {stderr}\n"
+                "Add a passwordless sudo entry; see README 'AWS VM bootstrap'."
+            ) from None
 
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
