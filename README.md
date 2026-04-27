@@ -179,7 +179,8 @@ first call, installs `requirements.txt`, and forwards every argument to
 ./runBenchmark.sh --dry-run                              # validate config + show selection
 ./runBenchmark.sh                                        # full sweep with config.yaml
 ./runBenchmark.sh --filter '*BALANCE*30M*'               # filter override
-./runBenchmark.sh --filter '*sload_bloated*' --limit 1   # one test only (handy for debugging)
+./runBenchmark.sh --filter '*sload_bloated*' --limit 1   # first match alphabetically
+./runBenchmark.sh --filter '*sload_bloated*' --pick      # interactive picker, run only the chosen one
 ./runBenchmark.sh -c staging.yaml                        # different config
 CONFIG=staging.yaml ./runBenchmark.sh                    # same, via env var
 ```

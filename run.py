@@ -539,7 +539,41 @@ def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
     return True
 
 
-def run_sweep(cfg: Config, filter_override: str | None, limit: int | None, dry_run: bool) -> int:
+def _interactive_pick(tests: list[str], log: SweepLog) -> list[str]:
+    """List matched tests and let the user pick exactly one."""
+    if not tests:
+        return tests
+    if len(tests) == 1:
+        log.event(f"--pick: only one match, running it: {tests[0]}")
+        return tests
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "--pick requires an interactive terminal but stdin is not a TTY. "
+            "Tighten --filter or use --limit 1 for non-interactive selection."
+        )
+    print()
+    print(f"Pick a test ({len(tests)} match the filter):")
+    for i, name in enumerate(tests, start=1):
+        print(f"  [{i:>4}] {name}")
+    print()
+    while True:
+        raw = input(f"Enter a number 1..{len(tests)} (q to abort): ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise KeyboardInterrupt
+        try:
+            choice = int(raw)
+        except ValueError:
+            print(f"  not a number: {raw!r}")
+            continue
+        if 1 <= choice <= len(tests):
+            picked = tests[choice - 1]
+            log.event(f"--pick: selected {choice}/{len(tests)} -> {picked}")
+            return [picked]
+        print(f"  out of range, must be 1..{len(tests)}")
+
+
+def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
+              pick: bool, dry_run: bool) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
@@ -551,9 +585,17 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None, dry_r
         f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
     )
 
+    if pick and not dry_run:
+        tests = _interactive_pick(tests, log)
+
     if dry_run:
         (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
         log.event("dry-run: wrote selected_tests.txt and exiting")
+        if pick:
+            print()
+            print(f"Pick preview ({len(tests)} match):")
+            for i, name in enumerate(tests, start=1):
+                print(f"  [{i:>4}] {name}")
         log.flush_summary({"dry_run": True, "selected": len(tests)})
         log.close()
         return 0
@@ -668,6 +710,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="override tests.filter glob (e.g. '*BALANCE*30M*')")
     p.add_argument("--limit", "-n", type=int, default=None,
                    help="run at most N tests after filtering (use --limit 1 for a single test)")
+    p.add_argument("--pick", "-p", action="store_true",
+                   help="list matched tests and prompt to pick exactly one (interactive)")
     p.add_argument("--dry-run", action="store_true",
                    help="resolve config + selected tests, then exit without touching the system")
     return p.parse_args(argv)
@@ -684,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = load_config(_abs_path(args.config))
     _install_sigint_handler()
-    return run_sweep(cfg, filter_override=args.filter, limit=args.limit, dry_run=args.dry_run)
+    return run_sweep(cfg, filter_override=args.filter, limit=args.limit,
+                     pick=args.pick, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
