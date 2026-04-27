@@ -258,12 +258,20 @@ def stop_container(name: str) -> None:
     _run(DOCKER + ["rm", "-f", name], check=False, capture=True)
 
 
-def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
+def start_besu(cfg: BesuConfig, log: SweepLog, *, layer: str = "test") -> None:
+    """Boot Besu with its data-path bound to one of the two overlay layers.
+
+    layer="prelude" - used during the prelude phase. Writes (gas-bump +
+                      funding) land in <overlay_dir>/prelude/upper, which
+                      then becomes the persistent base for every test.
+    layer="test"    - used per test. Writes go to <overlay_dir>/test/upper,
+                      which is wiped (`reset-test`) between tests; the
+                      prelude/upper underneath is preserved.
+    """
+    if layer not in ("prelude", "test"):
+        raise ValueError(f"start_besu: unknown layer {layer!r}")
     stop_container(cfg.container_name)
-    # The container always sees the test-layer merged dir; the test layer
-    # stacks on top of the prelude layer, which itself stacks on the
-    # read-only snapshot.
-    merged = cfg.overlay_dir / "test" / "merged"
+    merged = cfg.overlay_dir / layer / "merged"
     # NOTE: no --rm here. We want the container to stick around if Besu
     # crashes, so wait_for_engine can dump `docker logs` on failure.
     # stop_container() above and at end-of-test cleans it up.
@@ -384,9 +392,14 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
     )
 
 
-# Statuses that count as success per Engine API spec.
-_NEWPAYLOAD_OK = {"VALID", "ACCEPTED", "SYNCING"}
-_FCU_OK = {"VALID", "SYNCING"}
+# For deterministic replay against a prepared snapshot we expect every
+# block we send to be fully imported, so the only acceptable status is
+# VALID. ACCEPTED means "looks ok but parent unknown", SYNCING means
+# "parent missing, please backfill" - both indicate the chain is not
+# being built where we think it is and silently accepting them masks
+# bugs (e.g. wrong overlay layer => prelude state missing).
+_NEWPAYLOAD_OK = {"VALID"}
+_FCU_OK = {"VALID"}
 
 
 def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
@@ -653,7 +666,9 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
         else:
             overlay_mount_all(cfg.besu, log)
 
-        start_besu(cfg.besu, log)
+        # Prelude container writes into the prelude layer so that gas-bump +
+        # funding state survives across the per-test resets below.
+        start_besu(cfg.besu, log, layer="prelude")
         started_container = True
         wait_for_engine(cfg.besu, secret, log)
 
@@ -673,7 +688,9 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                 for idx, name in enumerate(tests, start=1):
                     log.event(f"[{idx}/{len(tests)}] {name}")
                     overlay_reset_test(cfg.besu, log)
-                    start_besu(cfg.besu, log)
+                    # Per-test container writes into the test layer (which
+                    # gets wiped on the next reset-test).
+                    start_besu(cfg.besu, log, layer="test")
                     wait_for_engine(cfg.besu, secret, log)
                     if not _run_test_pair(cfg, secret, session, setup_dir, testing_dir, name, log):
                         sweep_ok = False
