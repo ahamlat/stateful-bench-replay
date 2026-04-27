@@ -588,8 +588,11 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     if pick and not dry_run:
         tests = _interactive_pick(tests, log)
 
+    # Always record the resolved selection so a real run can be audited later
+    # (and so `--pick --dry-run` still prints a stable preview file).
+    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
+
     if dry_run:
-        (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
         log.event("dry-run: wrote selected_tests.txt and exiting")
         if pick:
             print()
