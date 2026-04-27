@@ -85,11 +85,28 @@ class RunConfig:
 
 
 @dataclasses.dataclass
+class ProfileConfig:
+    """Async-profiler integration. When enabled (via config or --profile),
+    the runner brackets the LAST newPayload+FCU pair of each phase with
+    `asprof start`/`asprof stop` calls, producing one flame graph per phase
+    in runs/<ts>/.
+    """
+    enabled: bool
+    host_dir: Path                 # host path with bin/asprof
+    container_dir: str             # mount target inside container
+    event: str                     # cpu | wall | itimer | alloc | lock | ...
+    interval: str                  # asprof -i value (e.g. "1ms", "500us")
+    output_format: str             # html | jfr | flamegraph (-> .html)
+    extra_args: list[str]          # extra flags passed to asprof start
+
+
+@dataclasses.dataclass
 class Config:
     besu: BesuConfig
     input: InputConfig
     tests: TestsConfig
     run: RunConfig
+    profile: ProfileConfig
 
 
 def _abs_path(p: str | os.PathLike) -> Path:
@@ -136,6 +153,20 @@ def load_config(path: Path) -> Config:
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
         ),
+        profile=_load_profile(raw.get("profile")),
+    )
+
+
+def _load_profile(raw: dict | None) -> ProfileConfig:
+    raw = raw or {}
+    return ProfileConfig(
+        enabled=bool(raw.get("enabled", False)),
+        host_dir=_abs_path(raw.get("host_dir", "~/async-profiler")),
+        container_dir=str(raw.get("container_dir", "/opt/async-profiler")),
+        event=str(raw.get("event", "cpu")),
+        interval=str(raw.get("interval", "1ms")),
+        output_format=str(raw.get("output_format", "html")),
+        extra_args=list(raw.get("extra_args") or []),
     )
 
 
@@ -219,6 +250,11 @@ def _run(cmd: list[str], check: bool = True, capture: bool = False) -> subproces
 # through sudoers NOPASSWD" model (overlay.sh + docker).
 DOCKER = ["sudo", "-n", "docker"]
 
+# Where the runner bind-mounts the per-run profile output dir inside the
+# Besu container. asprof writes flame graphs there; because it is a bind
+# mount, files appear directly under runs/<ts>/profiles/ on the host.
+PROFILE_OUTPUT_CONTAINER_DIR = "/opt/besu/profile-output"
+
 
 def _container_exists(name: str) -> bool:
     res = _run(
@@ -271,7 +307,100 @@ def save_container_logs(name: str, dest: Path, log: SweepLog) -> None:
     log.event(f"saved {len(out.splitlines())} log lines to {dest}")
 
 
-def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
+# ---------------------------------------------------------------------------
+# Async-profiler integration
+# ---------------------------------------------------------------------------
+
+class ProfilerSession:
+    """Brackets a critical section with `asprof start` / `asprof stop`.
+
+    asprof is invoked via `docker exec` inside the besu-bench container, so
+    we don't have to fight host/container PID namespacing. PID 1 inside the
+    container is the JVM (Besu's launcher exec's java in place).
+
+    We choose the output filename when the session is created; that way the
+    flame graph appears in runs/<ts>/<output_name> directly (the per-run
+    log dir is bind-mounted into the container).
+    """
+
+    def __init__(self, cfg: ProfileConfig, container: str, output_name: str,
+                 log: SweepLog):
+        self.cfg = cfg
+        self.container = container
+        self.output_name = output_name
+        self.log = log
+        self.started = False
+
+    @property
+    def _asprof(self) -> str:
+        return f"{self.cfg.container_dir}/bin/asprof"
+
+    @property
+    def _container_output_path(self) -> str:
+        return f"{PROFILE_OUTPUT_CONTAINER_DIR}/{self.output_name}"
+
+    def _exec(self, *args: str) -> subprocess.CompletedProcess:
+        cmd = DOCKER + ["exec", self.container] + list(args)
+        return _run(cmd, capture=True, check=False)
+
+    def start(self) -> None:
+        # Note on PID: the entrypoint we use (/opt/besu/bin/besu) is a shell
+        # script that exec's java, so PID 1 is the JVM by the time we get
+        # here. If you use a different entrypoint, adjust accordingly.
+        args = [
+            self._asprof, "start",
+            "-e", self.cfg.event,
+            "-i", self.cfg.interval,
+            *self.cfg.extra_args,
+            "1",
+        ]
+        res = self._exec(*args)
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()
+            self.log.event(f"asprof start FAILED ({res.returncode}): {err}")
+            self.log.event(
+                "  hint: async-profiler needs kernel.perf_event_paranoid<=1 "
+                "for `cpu` event. Try: sudo sysctl -w kernel.perf_event_paranoid=1, "
+                "or set profile.event=wall to avoid perf_events entirely."
+            )
+            return
+        self.started = True
+        self.log.event(
+            f"asprof started (event={self.cfg.event}, "
+            f"output -> runs/.../{self.output_name})"
+        )
+
+    def stop(self) -> None:
+        if not self.started:
+            return
+        args = [
+            self._asprof, "stop",
+            "-f", self._container_output_path,
+            "1",
+        ]
+        res = self._exec(*args)
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()
+            self.log.event(f"asprof stop FAILED ({res.returncode}): {err}")
+        else:
+            self.log.event(f"asprof stopped, wrote {self.output_name}")
+        self.started = False
+
+
+def _profile_output_filename(idx: int, phase: str, fmt: str) -> str:
+    """e.g. profile-0001-setup.html"""
+    ext_map = {"html": "html", "flamegraph": "html", "jfr": "jfr"}
+    ext = ext_map.get(fmt, fmt)
+    return f"profile-{idx:04d}-{phase}.{ext}"
+
+
+def start_besu(
+    cfg: BesuConfig,
+    log: SweepLog,
+    *,
+    profile: ProfileConfig | None = None,
+    profile_output_dir: Path | None = None,
+) -> None:
     """Boot Besu with its data-path bound to the test overlay layer.
 
     Each benchmark run does the entire flow (gas-bump + funding + setup +
@@ -279,6 +408,9 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     across multiple overlay layers anymore. We always mount
     <overlay_dir>/test/merged; the prelude overlay layer remains in the
     on-disk layout for backwards compatibility but no longer holds state.
+
+    If `profile` is enabled, also bind-mount async-profiler read-only and
+    a writable output dir for flame graphs.
     """
     stop_container(cfg.container_name)
     merged = cfg.overlay_dir / "test" / "merged"
@@ -295,6 +427,19 @@ def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
         docker_cmd += ["--entrypoint", cfg.entrypoint]
     for spec in cfg.extra_mounts:
         docker_cmd += ["-v", spec]
+    if profile is not None and profile.enabled:
+        if not (profile.host_dir / "bin" / "asprof").exists():
+            raise RuntimeError(
+                f"profile.enabled=true but {profile.host_dir / 'bin' / 'asprof'} "
+                "does not exist. Run scripts/install-async-profiler.sh first."
+            )
+        if profile_output_dir is None:
+            raise RuntimeError("start_besu: profile.enabled but no profile_output_dir given")
+        profile_output_dir.mkdir(parents=True, exist_ok=True)
+        docker_cmd += [
+            "-v", f"{profile.host_dir}:{profile.container_dir}:ro",
+            "-v", f"{profile_output_dir}:{PROFILE_OUTPUT_CONTAINER_DIR}",
+        ]
     docker_cmd.append(cfg.image)
     docker_cmd.append(f"--data-path={cfg.container_data_path}")
     docker_cmd += cfg.extra_args
@@ -507,23 +652,11 @@ def post_engine_line(
     return resp.status_code, body, None
 
 
-def replay_file(
-    cfg: Config,
-    secret: bytes,
-    session: requests.Session,
-    file_path: Path,
-    log: SweepLog,
-    phase: str | None = None,
-) -> bool:
-    """Replay one .txt file line-by-line. Returns False iff fail_fast tripped.
-
-    `phase` is an optional human label ("setup", "testing", ...) prepended to
-    the event log so that paired files (setup/<name>.txt and testing/<name>.txt
-    sharing the same basename) can be told apart at a glance.
-    """
-    label = file_path.name
-    prefix = f"replay [{phase}] " if phase else "replay "
-    log.event(f"{prefix}{label}")
+def _scan_lines(file_path: Path) -> list[tuple[int, str, str]]:
+    """Return [(line_no, method, raw_line)] for non-empty, json-decodable
+    lines. Bad lines are surfaced later through the normal failure path; we
+    only use this scan to find the index of the last newPayload."""
+    out: list[tuple[int, str, str]] = []
     with file_path.open("r") as fh:
         for line_no, raw in enumerate(fh, start=1):
             raw = raw.strip()
@@ -531,33 +664,86 @@ def replay_file(
                 continue
             try:
                 method = json.loads(raw).get("method", "?")
-            except json.JSONDecodeError as e:
-                log.record_fail(label, line_no, "bad_json", {"error": repr(e)})
-                if cfg.run.fail_fast:
-                    return False
-                continue
+            except json.JSONDecodeError:
+                method = ""
+            out.append((line_no, method, raw))
+    return out
 
-            status, body, err = post_engine_line(cfg, secret, session, raw)
-            if err is not None and body is None:
-                log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
-                if cfg.run.fail_fast:
-                    return False
-                continue
-            if status != 200:
-                log.record_fail(label, line_no, "http_status",
-                                {"method": method, "status": status,
-                                 "body": json.dumps(body) if body is not None else err})
-                if cfg.run.fail_fast:
-                    return False
-                continue
 
-            ok, kind, detail = _classify(method, body or {})
-            if ok:
-                log.record_ok(label)
-            else:
-                log.record_fail(label, line_no, kind, {"method": method, **detail})
-                if cfg.run.fail_fast:
-                    return False
+def replay_file(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    file_path: Path,
+    log: SweepLog,
+    phase: str | None = None,
+    profiler: ProfilerSession | None = None,
+) -> bool:
+    """Replay one .txt file line-by-line. Returns False iff fail_fast tripped.
+
+    `phase` is an optional human label ("setup", "testing", ...) prepended to
+    the event log so that paired files (setup/<name>.txt and testing/<name>.txt
+    sharing the same basename) can be told apart at a glance.
+
+    If `profiler` is given, async-profiler is started just before the file's
+    LAST newPayload call and stopped after the LAST line of the file has been
+    processed. That brackets exactly the heavy block (and its trailing FCU)
+    in setup/, and the single measured block in testing/.
+    """
+    label = file_path.name
+    prefix = f"replay [{phase}] " if phase else "replay "
+    log.event(f"{prefix}{label}")
+
+    items = _scan_lines(file_path)
+
+    # Index of the LAST engine_newPayload* line, or -1 if none.
+    last_np_idx = -1
+    for i, (_ln, method, _raw) in enumerate(items):
+        if method.startswith("engine_newPayload"):
+            last_np_idx = i
+
+    profile_active = False
+    for i, (line_no, method, raw) in enumerate(items):
+        if not method:
+            log.record_fail(label, line_no, "bad_json", {})
+            if cfg.run.fail_fast:
+                return False
+            continue
+
+        if profiler is not None and i == last_np_idx and not profile_active:
+            profiler.start()
+            profile_active = True
+
+        status, body, err = post_engine_line(cfg, secret, session, raw)
+        if err is not None and body is None:
+            log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
+            if cfg.run.fail_fast:
+                if profile_active:
+                    profiler.stop()
+                return False
+            continue
+        if status != 200:
+            log.record_fail(label, line_no, "http_status",
+                            {"method": method, "status": status,
+                             "body": json.dumps(body) if body is not None else err})
+            if cfg.run.fail_fast:
+                if profile_active:
+                    profiler.stop()
+                return False
+            continue
+
+        ok, kind, detail = _classify(method, body or {})
+        if ok:
+            log.record_ok(label)
+        else:
+            log.record_fail(label, line_no, kind, {"method": method, **detail})
+            if cfg.run.fail_fast:
+                if profile_active:
+                    profiler.stop()
+                return False
+
+    if profile_active:
+        profiler.stop()
     return True
 
 
@@ -607,11 +793,16 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None) 
 # ---------------------------------------------------------------------------
 
 def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
-                   setup_dir: Path, testing_dir: Path, name: str, log: SweepLog) -> bool:
-    if not replay_file(cfg, secret, session, setup_dir / name, log, phase="setup"):
+                   setup_dir: Path, testing_dir: Path, name: str, log: SweepLog,
+                   *,
+                   setup_profiler: ProfilerSession | None = None,
+                   testing_profiler: ProfilerSession | None = None) -> bool:
+    if not replay_file(cfg, secret, session, setup_dir / name, log,
+                       phase="setup", profiler=setup_profiler):
         log.event(f"fail-fast tripped during setup of {name}")
         return False
-    if not replay_file(cfg, secret, session, testing_dir / name, log, phase="testing"):
+    if not replay_file(cfg, secret, session, testing_dir / name, log,
+                       phase="testing", profiler=testing_profiler):
         log.event(f"fail-fast tripped during testing of {name}")
         return False
     return True
@@ -739,7 +930,11 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                 # Everything below writes into the test layer.
                 overlay_reset_all(cfg.besu, log)
 
-                start_besu(cfg.besu, log)
+                start_besu(
+                    cfg.besu, log,
+                    profile=cfg.profile if cfg.profile.enabled else None,
+                    profile_output_dir=log.root if cfg.profile.enabled else None,
+                )
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
                 log_chain_head(
@@ -747,10 +942,32 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     f"[{idx}/{len(tests)}] head BEFORE prelude"
                 )
 
+                # Build profiler sessions for this test (one per phase).
+                # The runner brackets the LAST newPayload+FCU pair of each
+                # phase, which corresponds to the heavy setup block and the
+                # measured testing block respectively.
+                setup_profiler: ProfilerSession | None = None
+                testing_profiler: ProfilerSession | None = None
+                if cfg.profile.enabled:
+                    setup_profiler = ProfilerSession(
+                        cfg.profile,
+                        cfg.besu.container_name,
+                        _profile_output_filename(idx, "setup", cfg.profile.output_format),
+                        log,
+                    )
+                    testing_profiler = ProfilerSession(
+                        cfg.profile,
+                        cfg.besu.container_name,
+                        _profile_output_filename(idx, "testing", cfg.profile.output_format),
+                        log,
+                    )
+
                 test_ok = True
 
                 # Phase A: prelude (gas-bump.txt then funding.txt) in this
                 # same container. Writes go into the test overlay layer.
+                # Prelude is NOT profiled - it is identical across tests
+                # and not what we are measuring.
                 for fname in cfg.input.prelude:
                     if not replay_file(
                         cfg, secret, session,
@@ -769,6 +986,8 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     if not _run_test_pair(
                         cfg, secret, session,
                         setup_dir, testing_dir, name, log,
+                        setup_profiler=setup_profiler,
+                        testing_profiler=testing_profiler,
                     ):
                         test_ok = False
                     else:
@@ -829,6 +1048,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="list matched tests and prompt to pick exactly one (interactive)")
     p.add_argument("--dry-run", action="store_true",
                    help="resolve config + selected tests, then exit without touching the system")
+    p.add_argument("--profile", action="store_true",
+                   help="enable async-profiler around the last newPayload+FCU pair "
+                        "of setup/ and testing/ (overrides profile.enabled in yaml)")
     return p.parse_args(argv)
 
 
@@ -842,6 +1064,8 @@ def _install_sigint_handler() -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = load_config(_abs_path(args.config))
+    if args.profile:
+        cfg.profile.enabled = True
     _install_sigint_handler()
     return run_sweep(cfg, filter_override=args.filter, limit=args.limit,
                      pick=args.pick, dry_run=args.dry_run)

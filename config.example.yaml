@@ -136,3 +136,37 @@ run:
   # Stop and remove the Besu container when the sweep finishes (or on error).
   # Set false to leave it running for inspection.
   stop_container_on_exit: true
+
+# Async-profiler integration (optional). When enabled (here OR via --profile
+# on the CLI), the runner brackets the LAST newPayload + FCU pair of each
+# phase with `asprof start` / `asprof stop`. This gives one flame graph per
+# phase per test: the heavy setup block and the measured testing block.
+#
+# Bootstrap once:  scripts/install-async-profiler.sh /home/<user>/async-profiler
+# CPU profiling needs:  sudo sysctl -w kernel.perf_event_paranoid=1
+# (use event=wall to skip that requirement at the cost of CPU vs wall fidelity)
+profile:
+  # CLI --profile sets this to true. Default keeps it off to avoid surprises.
+  enabled: false
+
+  # Host directory containing bin/asprof (extracted by install-async-profiler.sh).
+  host_dir: /home/ahamlat/async-profiler
+
+  # Where the runner bind-mounts host_dir read-only inside the Besu container.
+  # Anywhere safe for that image will do.
+  container_dir: /opt/async-profiler
+
+  # asprof event: cpu (perf_events, needs paranoid<=1), wall (no privileges,
+  # picks up wait time too), itimer, alloc, lock, ...
+  event: cpu
+
+  # asprof sampling interval (-i). 1ms is a good default for 1-15s blocks.
+  interval: 1ms
+
+  # Output format -> file extension. html/flamegraph -> .html, jfr -> .jfr.
+  # html is self-contained and viewable in a browser; jfr needs JMC/IntelliJ.
+  output_format: html
+
+  # Extra flags passed verbatim to `asprof start` (e.g. --cstack=fp,
+  # --threads, --include=...). Leave empty unless you know what you want.
+  extra_args: []

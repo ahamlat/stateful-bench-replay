@@ -181,6 +181,7 @@ first call, installs `requirements.txt`, and forwards every argument to
 ./runBenchmark.sh --filter '*BALANCE*30M*'               # filter override
 ./runBenchmark.sh --filter '*sload_bloated*' --limit 1   # first match alphabetically
 ./runBenchmark.sh --filter '*sload_bloated*' --pick      # interactive picker, run only the chosen one
+./runBenchmark.sh --filter '*sload_bloated*' --limit 1 --profile  # also run async-profiler
 ./runBenchmark.sh -c staging.yaml                        # different config
 CONFIG=staging.yaml ./runBenchmark.sh                    # same, via env var
 ```
@@ -217,6 +218,62 @@ LATEST=$(ls -1d runs/* | tail -n1)
 grep 'head =' "$LATEST/events.log"          # head before/after each phase
 grep 'Imported #' "$LATEST/besu-0001.log"   # block-by-block import log
 ```
+
+## Async-profiler
+
+The runner can drive [async-profiler](https://github.com/async-profiler/async-profiler)
+to capture flame graphs around exactly the interesting blocks: the **last
+block of `setup/<name>.txt`** (the heavy state-building block) and the
+**block of `testing/<name>.txt`** (the measured block).
+
+It works by bind-mounting an extracted async-profiler tarball read-only
+into the Besu container, and running `asprof start` / `asprof stop` over
+`docker exec`. The JVM has PID 1 inside the container, so no PID-namespace
+gymnastics are needed.
+
+### One-time setup
+
+```bash
+# Download + extract async-profiler 4.4 (linux-x64) into ~/async-profiler
+~/stateful-bench-replay/scripts/install-async-profiler.sh
+
+# `cpu` event uses Linux perf_events; lower the paranoid level once.
+# (For wall-clock profiling without privileges, set profile.event=wall.)
+sudo sysctl -w kernel.perf_event_paranoid=1
+echo "kernel.perf_event_paranoid = 1" | sudo tee /etc/sysctl.d/99-asprof.conf
+```
+
+### Per-run usage
+
+Either flip `profile.enabled: true` in `config.yaml`, or pass `--profile`
+on the CLI:
+
+```bash
+./runBenchmark.sh --filter '*sload_bloated*' --limit 1 --profile
+```
+
+Per selected test you'll get two flame graphs in the run dir:
+
+```
+runs/<ts>/
+    profile-0001-setup.html       # heavy setup block (cold cache)
+    profile-0001-testing.html     # testing block (warm cache)
+    ...
+```
+
+Open the `.html` files in any browser. Common knobs in `config.yaml` →
+`profile`:
+
+- `event: cpu | wall | itimer | alloc | lock` — `cpu` for hot methods,
+  `wall` includes wait/IO time and works without `perf_event_paranoid`.
+- `output_format: html | jfr` — `html` is self-contained, `jfr` opens in
+  IntelliJ / JMC for richer analysis.
+- `extra_args: [...]` — passed verbatim to `asprof start`
+  (e.g. `--cstack=fp`, `--threads`).
+
+If `asprof start` fails with `perf_event_open() failed`, your kernel
+still has `perf_event_paranoid >= 2`; either lower it (above) or switch
+to `event: wall`.
 
 ## Operational notes
 
