@@ -97,15 +97,25 @@ Key fields:
 
 ## Run
 
+The easiest entry point is the wrapper script: it auto-creates a venv on
+first call, installs `requirements.txt`, and forwards every argument to
+`run.py`.
+
 ```bash
-# Validate config + see what would run, without touching the system.
-python3 run.py --config config.yaml --dry-run
+# First call also bootstraps ./venv/ from requirements.txt.
+./runBenchmark.sh --dry-run                  # validate config + show selection
+./runBenchmark.sh                            # full sweep with config.yaml
+./runBenchmark.sh --filter '*BALANCE*30M*'   # filter override
+./runBenchmark.sh -c staging.yaml            # different config
+CONFIG=staging.yaml ./runBenchmark.sh        # same, via env var
+```
 
-# Full sweep with all matched tests.
-python3 run.py --config config.yaml
+You can still call `run.py` directly if you prefer:
 
-# Override the filter on the CLI (wins over tests.filter in YAML).
-python3 run.py --config config.yaml --filter '*BALANCE*30M*'
+```bash
+./venv/bin/python3 run.py --config config.yaml --dry-run
+./venv/bin/python3 run.py --config config.yaml
+./venv/bin/python3 run.py --config config.yaml --filter '*BALANCE*30M*'
 ```
 
 Each invocation creates a timestamped subdir under `run.log_dir`:
