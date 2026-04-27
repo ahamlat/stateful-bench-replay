@@ -516,10 +516,17 @@ def replay_file(
     session: requests.Session,
     file_path: Path,
     log: SweepLog,
+    phase: str | None = None,
 ) -> bool:
-    """Replay one .txt file line-by-line. Returns False iff fail_fast tripped."""
+    """Replay one .txt file line-by-line. Returns False iff fail_fast tripped.
+
+    `phase` is an optional human label ("setup", "testing", ...) prepended to
+    the event log so that paired files (setup/<name>.txt and testing/<name>.txt
+    sharing the same basename) can be told apart at a glance.
+    """
     label = file_path.name
-    log.event(f"replay {label}")
+    prefix = f"replay [{phase}] " if phase else "replay "
+    log.event(f"{prefix}{label}")
     with file_path.open("r") as fh:
         for line_no, raw in enumerate(fh, start=1):
             raw = raw.strip()
@@ -604,10 +611,10 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None) 
 
 def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
                    setup_dir: Path, testing_dir: Path, name: str, log: SweepLog) -> bool:
-    if not replay_file(cfg, secret, session, setup_dir / name, log):
+    if not replay_file(cfg, secret, session, setup_dir / name, log, phase="setup"):
         log.event(f"fail-fast tripped during setup of {name}")
         return False
-    if not replay_file(cfg, secret, session, testing_dir / name, log):
+    if not replay_file(cfg, secret, session, testing_dir / name, log, phase="testing"):
         log.event(f"fail-fast tripped during testing of {name}")
         return False
     return True
