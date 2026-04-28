@@ -390,11 +390,40 @@ class ProfilerSession:
         self.started = False
 
 
-def _profile_output_filename(idx: int, phase: str, fmt: str) -> str:
-    """e.g. profile-0001-setup.html"""
+_MAX_SLUG_LEN = 80
+
+
+def _slugify(name: str) -> str:
+    """Make a test basename safe for filenames: keep [A-Za-z0-9_], replace
+    everything else with `-`, collapse repeats, trim, cap length. The cap
+    keeps total path length manageable (some test names are >150 chars)."""
+    out: list[str] = []
+    last_dash = False
+    for ch in name:
+        if ch.isalnum() or ch == "_":
+            out.append(ch)
+            last_dash = False
+        else:
+            if not last_dash:
+                out.append("-")
+            last_dash = True
+    slug = "".join(out).strip("-")
+    if len(slug) > _MAX_SLUG_LEN:
+        slug = slug[:_MAX_SLUG_LEN].rstrip("-")
+    return slug or "test"
+
+
+def _besu_log_filename(idx: int, name: str, failed: bool = False) -> str:
+    """e.g. besu-0001-test_single_opcode_py__test_sload_bloated-...log"""
+    suffix = "-FAIL" if failed else ""
+    return f"besu-{idx:04d}-{_slugify(name)}{suffix}.log"
+
+
+def _profile_output_filename(idx: int, name: str, phase: str, fmt: str) -> str:
+    """e.g. profile-0001-test_..._sload_bloated-...-setup.html"""
     ext_map = {"html": "html", "flamegraph": "html", "jfr": "jfr"}
     ext = ext_map.get(fmt, fmt)
-    return f"profile-{idx:04d}-{phase}.{ext}"
+    return f"profile-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
 
 
 def start_besu(
@@ -955,13 +984,13 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     setup_profiler = ProfilerSession(
                         cfg.profile,
                         cfg.besu.container_name,
-                        _profile_output_filename(idx, "setup", cfg.profile.output_format),
+                        _profile_output_filename(idx, name, "setup", cfg.profile.output_format),
                         log,
                     )
                     testing_profiler = ProfilerSession(
                         cfg.profile,
                         cfg.besu.container_name,
-                        _profile_output_filename(idx, "testing", cfg.profile.output_format),
+                        _profile_output_filename(idx, name, "testing", cfg.profile.output_format),
                         log,
                     )
 
@@ -1000,11 +1029,12 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                         )
 
                 # Persist full container log before we tear it down. Failed
-                # runs get a -FAIL suffix to make them easy to spot.
-                suffix = "" if test_ok else "-FAIL"
+                # runs get a -FAIL suffix to make them easy to spot. The
+                # filename embeds a slug of the test name so runs/<ts>/ ls
+                # is self-documenting once you have several tests.
                 save_container_logs(
                     cfg.besu.container_name,
-                    log.root / f"besu-{idx:04d}{suffix}.log",
+                    log.root / _besu_log_filename(idx, name, failed=not test_ok),
                     log,
                 )
                 stop_container(cfg.besu.container_name)

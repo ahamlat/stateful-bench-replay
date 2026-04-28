@@ -79,19 +79,23 @@ First call bootstraps `./venv/` from `requirements.txt` automatically.
 Every run creates `runs/<timestamp>/`:
 
 ```
-events.log         # human-readable timeline (per-phase chain head, etc.)
-failures.jsonl     # one JSON object per non-VALID response (empty == all good)
-summary.json       # per-file ok/fail counters
-besu-0001.log      # full `docker logs` of test #1's Besu container
-selected_tests.txt # the resolved test list
+events.log              # human-readable timeline (per-phase chain head, etc.)
+failures.jsonl          # one JSON object per non-VALID response (empty == all good)
+summary.json            # per-file ok/fail counters
+besu-0001-<slug>.log    # full `docker logs` of test #1's Besu container
+selected_tests.txt      # the resolved test list
 ```
+
+The `<slug>` in artefact filenames is a sanitised version of the test
+name, so `ls runs/<ts>/` is self-documenting once you've run several
+tests.
 
 Quick checks:
 
 ```bash
 LATEST=$(ls -1d runs/* | tail -n1)
-grep 'head =' "$LATEST/events.log"           # chain head before/after each phase
-grep 'Imported #' "$LATEST/besu-0001.log"    # block-by-block import timing
+grep 'head =' "$LATEST/events.log"             # chain head before/after each phase
+grep 'Imported #' "$LATEST"/besu-0001-*.log    # block-by-block import timing
 ```
 
 `SYNCING`/`ACCEPTED` responses are recorded as failures on purpose: for
@@ -109,9 +113,10 @@ scripts/install-async-profiler.sh
 ```
 
 Output flame graphs land in the run dir as
-`profile-0001-setup.html` and `profile-0001-testing.html` — open them in a
-browser. Default event is `wall` (per-thread, no kernel tuning needed).
-Edit `profile.event: cpu` in `config.yaml` for on-CPU flame graphs after
+`profile-0001-<slug>-setup.html` and
+`profile-0001-<slug>-testing.html` — open them in a browser. Default
+event is `wall` (per-thread, no kernel tuning needed). Edit
+`profile.event: cpu` in `config.yaml` for on-CPU flame graphs after
 `sudo sysctl -w kernel.perf_event_paranoid=1`.
 
 ## Troubleshooting
