@@ -129,3 +129,8 @@ event is `wall` (per-thread, no kernel tuning needed). Edit
 - **Engine API timeout**: every host path in `besu.extra_mounts` must
   exist on the host; otherwise `docker run` silently creates an empty
   directory there and Besu fails before it logs anything.
+- **JWT secret missing** is auto-handled: if `besu.jwt_secret_path`
+  doesn't exist the runner copies from `/data/jwt.hex` or
+  `~/.besu/jwt.hex`, and otherwise generates a fresh 32-byte hex secret
+  in place. The same file is bind-mounted into the container so runner
+  and Besu always agree.

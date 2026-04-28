@@ -30,6 +30,7 @@ import fnmatch
 import json
 import os
 import random
+import shutil
 import shlex
 import signal
 import subprocess
@@ -529,6 +530,40 @@ def overlay_reset_test(cfg: BesuConfig, log: SweepLog) -> None:
 # JWT + Engine API
 # ---------------------------------------------------------------------------
 
+_JWT_FALLBACK_SOURCES = (
+    Path("/data/jwt.hex"),
+    Path.home() / ".besu" / "jwt.hex",
+)
+
+
+def ensure_jwt_secret(path: Path, log: SweepLog) -> None:
+    """Make sure `path` exists; if not, populate it.
+
+    Order of preference:
+      1. Copy from a well-known fallback (/data/jwt.hex, ~/.besu/jwt.hex).
+      2. Generate a fresh 32-byte hex secret.
+
+    Either way the file ends up with the JWT content the Besu container
+    will read via its bind-mount, so the runner and Besu agree on the
+    same secret.
+    """
+    if path.is_file():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for src in _JWT_FALLBACK_SOURCES:
+        if src.is_file() and src.resolve() != path.resolve():
+            shutil.copy2(src, path)
+            log.event(f"jwt secret missing at {path}; copied from {src}")
+            return
+    import secrets as _secrets
+    path.write_text(_secrets.token_hex(32))
+    try:
+        path.chmod(0o644)
+    except OSError:
+        pass
+    log.event(f"jwt secret missing at {path}; generated a fresh one")
+
+
 def load_jwt_secret(path: Path) -> bytes:
     raw = path.read_text().strip()
     if raw.startswith("0x"):
@@ -908,8 +943,11 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
         p = cfg.input.dir / name
         if not p.is_file():
             raise FileNotFoundError(f"prelude file missing: {p}")
-    if not cfg.besu.jwt_secret_path.is_file():
-        raise FileNotFoundError(f"jwt secret missing: {cfg.besu.jwt_secret_path}")
+    # JWT auto-provisioning: copy from a known fallback (/data/jwt.hex etc.)
+    # or generate a fresh one if nothing is available. /tmp paths in
+    # particular vanish across reboots, so this avoids "jwt secret missing"
+    # being the first thing you see after a host restart.
+    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
 
     # Validate every host bind-mount source up front: if it doesn't exist
     # `docker run` silently creates an empty directory there, the container
