@@ -236,9 +236,13 @@ gymnastics are needed.
 ```bash
 # Download + extract async-profiler 4.4 (linux-x64) into ~/async-profiler
 ~/stateful-bench-replay/scripts/install-async-profiler.sh
+```
 
-# `cpu` event uses Linux perf_events; lower the paranoid level once.
-# (For wall-clock profiling without privileges, set profile.event=wall.)
+That's it for the default `wall` event — no kernel tuning is required.
+If you switch to `event: cpu` (on-CPU profiling via Linux `perf_events`),
+also lower the paranoid level once:
+
+```bash
 sudo sysctl -w kernel.perf_event_paranoid=1
 echo "kernel.perf_event_paranoid = 1" | sudo tee /etc/sysctl.d/99-asprof.conf
 ```
@@ -264,16 +268,21 @@ runs/<ts>/
 Open the `.html` files in any browser. Common knobs in `config.yaml` →
 `profile`:
 
-- `event: cpu | wall | itimer | alloc | lock` — `cpu` for hot methods,
-  `wall` includes wait/IO time and works without `perf_event_paranoid`.
+- `event: wall | cpu | itimer | alloc | lock` — default `wall` captures
+  CPU + wait/IO and needs no kernel tuning. Switch to `cpu` for on-CPU
+  flame graphs once `perf_event_paranoid` is lowered.
 - `output_format: html | jfr` — `html` is self-contained, `jfr` opens in
   IntelliJ / JMC for richer analysis.
-- `extra_args: [...]` — passed verbatim to `asprof start`
-  (e.g. `--cstack=fp`, `--threads`).
+- `extra_args: [-t, ...]` — passed verbatim to `asprof start`. The
+  default `-t` produces a per-thread flame graph, which is essential for
+  reading vert.x worker activity and distinguishing parallel tx execution
+  from the critical path. Drop it if you want a single merged flame
+  graph.
 
-If `asprof start` fails with `perf_event_open() failed`, your kernel
-still has `perf_event_paranoid >= 2`; either lower it (above) or switch
-to `event: wall`.
+If you set `event: cpu` and `asprof start` fails with
+`perf_event_open() failed`, your kernel still has
+`perf_event_paranoid >= 2`; either lower it (see one-time setup) or
+keep the default `wall` event.
 
 ## Operational notes
 

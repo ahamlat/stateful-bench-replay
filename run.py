@@ -159,14 +159,17 @@ def load_config(path: Path) -> Config:
 
 def _load_profile(raw: dict | None) -> ProfileConfig:
     raw = raw or {}
+    # Default to wall-clock profiling with per-thread split: works without
+    # kernel.perf_event_paranoid tuning, and `-t` makes it easy to see which
+    # vert.x worker thread did the heavy lifting vs. main / GC threads.
     return ProfileConfig(
         enabled=bool(raw.get("enabled", False)),
         host_dir=_abs_path(raw.get("host_dir", "~/async-profiler")),
         container_dir=str(raw.get("container_dir", "/opt/async-profiler")),
-        event=str(raw.get("event", "cpu")),
+        event=str(raw.get("event", "wall")),
         interval=str(raw.get("interval", "1ms")),
         output_format=str(raw.get("output_format", "html")),
-        extra_args=list(raw.get("extra_args") or []),
+        extra_args=list(raw.get("extra_args") or ["-t"]),
     )
 
 

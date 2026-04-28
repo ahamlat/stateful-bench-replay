@@ -143,8 +143,6 @@ run:
 # phase per test: the heavy setup block and the measured testing block.
 #
 # Bootstrap once:  scripts/install-async-profiler.sh /home/<user>/async-profiler
-# CPU profiling needs:  sudo sysctl -w kernel.perf_event_paranoid=1
-# (use event=wall to skip that requirement at the cost of CPU vs wall fidelity)
 profile:
   # CLI --profile sets this to true. Default keeps it off to avoid surprises.
   enabled: false
@@ -156,9 +154,14 @@ profile:
   # Anywhere safe for that image will do.
   container_dir: /opt/async-profiler
 
-  # asprof event: cpu (perf_events, needs paranoid<=1), wall (no privileges,
-  # picks up wait time too), itimer, alloc, lock, ...
-  event: cpu
+  # asprof event:
+  #   wall   - wall-clock; no kernel tuning required, captures CPU + wait/IO time
+  #   cpu    - on-CPU only; needs sudo sysctl -w kernel.perf_event_paranoid=1
+  #   itimer - poor man's CPU profiler, no perf_events
+  #   alloc, lock, ...
+  # Default `wall` is the safe choice for quickly seeing where Besu spends
+  # its time during a heavy block (including I/O / lock waits).
+  event: wall
 
   # asprof sampling interval (-i). 1ms is a good default for 1-15s blocks.
   interval: 1ms
@@ -167,6 +170,9 @@ profile:
   # html is self-contained and viewable in a browser; jfr needs JMC/IntelliJ.
   output_format: html
 
-  # Extra flags passed verbatim to `asprof start` (e.g. --cstack=fp,
-  # --threads, --include=...). Leave empty unless you know what you want.
-  extra_args: []
+  # Extra flags passed verbatim to `asprof start`. Defaults include `-t` so
+  # the flame graph is split per thread (vert.x workers vs. main vs. GC),
+  # which is essential for telling parallel tx execution apart from the
+  # critical path. Add e.g. `--cstack=fp` for native frames.
+  extra_args:
+    - -t
