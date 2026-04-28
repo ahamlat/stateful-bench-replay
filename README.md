@@ -113,10 +113,16 @@ scripts/install-async-profiler.sh
 ```
 
 Output flame graphs land in the run dir as
-`<run-id>-profile-0001-<slug>-setup.html` and
-`<run-id>-profile-0001-<slug>-testing.html` — `<run-id>` is the
-timestamp folder, so the file is self-identifying once you copy it out
-of the run dir. Open them in a browser. Default event is `wall`
+`<run-id>-0001-<slug>-setup.html` and
+`<run-id>-0001-<slug>-testing.html` — `<run-id>` is the timestamp
+folder, so the file is self-identifying once you copy it out of the
+run dir. `<slug>` is a compact form of the test name with the boiler
+plate parameters stripped (`fork_Amsterdam`, `benchmark_test`,
+`initial_*_True`, etc.), so a filename typically looks like:
+
+```
+20260428-135916-0001-ext_account_query_warm-opcode_DELEGATECALL-benchmark_120M-testing.html
+``` Open them in a browser. Default event is `wall`
 (per-thread, no kernel tuning needed). Edit `profile.event: cpu` in
 `config.yaml` for on-CPU flame graphs after
 `sudo sysctl -w kernel.perf_event_paranoid=1`.

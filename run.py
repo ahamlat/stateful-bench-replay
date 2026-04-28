@@ -396,16 +396,63 @@ class ProfilerSession:
         self.started = False
 
 
-_MAX_SLUG_LEN = 80
+_MAX_SLUG_LEN = 60
+
+# Pytest test basenames look like:
+#   test_single_opcode.py__test_sload_bloated[10GB-fork_Amsterdam-
+#       benchmark_test-cache_strategy_CacheStrategy.CACHE_PREVIOUS_BLOCK-
+#       existing_slots_False-benchmark_120M].txt
+# Most of the bracket tokens are identical across the whole suite. We
+# drop them so the slug only carries what actually varies between tests.
+_SLUG_NOISE = (
+    "fork_Amsterdam",
+    "fork_Osaka",
+    "fork_Cancun",
+    "fork_Prague",
+    "benchmark_test",
+    "initial_storage_True",
+    "initial_storage_False",
+    "initial_balance_True",
+    "initial_balance_False",
+    "empty_code_True",
+    "empty_code_False",
+    "existing_slots_True",
+    "existing_slots_False",
+    "cache_strategy_CacheStrategy.",
+)
 
 
 def _slugify(name: str) -> str:
-    """Make a test basename safe for filenames: keep [A-Za-z0-9_], replace
-    everything else with `-`, collapse repeats, trim, cap length. The cap
-    keeps total path length manageable (some test names are >150 chars)."""
+    """Compact, filename-safe slug for a pytest test basename.
+
+    Examples:
+      test_single_opcode.py__test_sload_bloated[10GB-fork_Amsterdam-benchmark_test-
+          cache_strategy_CacheStrategy.CACHE_PREVIOUS_BLOCK-existing_slots_False-
+          benchmark_120M].txt
+        -> sload_bloated-10GB-CACHE_PREVIOUS_BLOCK-benchmark_120M
+
+      test_account_query.py__test_ext_account_query_warm[fork_Amsterdam-
+          benchmark_test-initial_storage_True-initial_balance_True-empty_code_True-
+          opcode_DELEGATECALL-benchmark_120M].txt
+        -> ext_account_query_warm-opcode_DELEGATECALL-benchmark_120M
+    """
+    s = name
+    # Drop trailing extension if any.
+    if s.endswith(".txt"):
+        s = s[:-4]
+    # Strip `<file>.py__test_` prefix so we keep only the function name +
+    # parametrisation. Falls back to `<file>.py__` if there is no test_ prefix.
+    if ".py__test_" in s:
+        s = s.split(".py__test_", 1)[1]
+    elif ".py__" in s:
+        s = s.split(".py__", 1)[1]
+    # Drop the always-present boilerplate parameters (see _SLUG_NOISE).
+    for tok in _SLUG_NOISE:
+        s = s.replace(tok, "")
+    # Replace anything not [A-Za-z0-9_] with a single dash; collapse repeats.
     out: list[str] = []
     last_dash = False
-    for ch in name:
+    for ch in s:
         if ch.isalnum() or ch == "_":
             out.append(ch)
             last_dash = False
@@ -420,22 +467,22 @@ def _slugify(name: str) -> str:
 
 
 def _besu_log_filename(idx: int, name: str, failed: bool = False) -> str:
-    """e.g. besu-0001-test_single_opcode_py__test_sload_bloated-...log"""
+    """e.g. besu-0001-sload_bloated-10GB-CACHE_PREVIOUS_BLOCK-benchmark_120M.log"""
     suffix = "-FAIL" if failed else ""
     return f"besu-{idx:04d}-{_slugify(name)}{suffix}.log"
 
 
 def _profile_output_filename(run_id: str, idx: int, name: str, phase: str, fmt: str) -> str:
-    """e.g. 20260428-135916-profile-0001-test_..._sload_bloated-...-setup.html
+    """e.g. 20260428-135916-0001-sload_bloated-10GB-CACHE_PREVIOUS_BLOCK-benchmark_120M-setup.html
 
-    Embedding the run-id (= run dir name = timestamp) in the filename makes
-    the artefacts self-identifying once they are copied out of the run dir
-    (attached to a ticket, scp'd to a laptop, dropped into a comparison
-    folder, etc.).
+    The `.html` (or `.jfr`) extension already identifies the file as a
+    flame graph, so we drop the "profile-" word prefix to keep the name
+    short. The run-id keeps the file self-identifying once it leaves
+    the run dir.
     """
     ext_map = {"html": "html", "flamegraph": "html", "jfr": "jfr"}
     ext = ext_map.get(fmt, fmt)
-    return f"{run_id}-profile-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
+    return f"{run_id}-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
 
 
 def start_besu(
