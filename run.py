@@ -328,12 +328,17 @@ class ProfilerSession:
     """
 
     def __init__(self, cfg: ProfileConfig, container: str, output_name: str,
-                 log: SweepLog):
+                 host_output_dir: Path, log: SweepLog):
         self.cfg = cfg
         self.container = container
         self.output_name = output_name
+        self.host_output_dir = host_output_dir
         self.log = log
         self.started = False
+
+    @property
+    def host_output_path(self) -> Path:
+        return self.host_output_dir / self.output_name
 
     @property
     def _asprof(self) -> str:
@@ -371,7 +376,7 @@ class ProfilerSession:
         self.started = True
         self.log.event(
             f"asprof started (event={self.cfg.event}, "
-            f"output -> runs/.../{self.output_name})"
+            f"output -> {self.host_output_path})"
         )
 
     def stop(self) -> None:
@@ -387,7 +392,7 @@ class ProfilerSession:
             err = (res.stderr or res.stdout or "").strip()
             self.log.event(f"asprof stop FAILED ({res.returncode}): {err}")
         else:
-            self.log.event(f"asprof stopped, wrote {self.output_name}")
+            self.log.event(f"asprof stopped, wrote {self.host_output_path}")
         self.started = False
 
 
@@ -420,11 +425,17 @@ def _besu_log_filename(idx: int, name: str, failed: bool = False) -> str:
     return f"besu-{idx:04d}-{_slugify(name)}{suffix}.log"
 
 
-def _profile_output_filename(idx: int, name: str, phase: str, fmt: str) -> str:
-    """e.g. profile-0001-test_..._sload_bloated-...-setup.html"""
+def _profile_output_filename(run_id: str, idx: int, name: str, phase: str, fmt: str) -> str:
+    """e.g. 20260428-135916-profile-0001-test_..._sload_bloated-...-setup.html
+
+    Embedding the run-id (= run dir name = timestamp) in the filename makes
+    the artefacts self-identifying once they are copied out of the run dir
+    (attached to a ticket, scp'd to a laptop, dropped into a comparison
+    folder, etc.).
+    """
     ext_map = {"html": "html", "flamegraph": "html", "jfr": "jfr"}
     ext = ext_map.get(fmt, fmt)
-    return f"profile-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
+    return f"{run_id}-profile-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
 
 
 def start_besu(
@@ -1019,16 +1030,19 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                 setup_profiler: ProfilerSession | None = None
                 testing_profiler: ProfilerSession | None = None
                 if cfg.profile.enabled:
+                    run_id = log.root.name  # the timestamp folder name
                     setup_profiler = ProfilerSession(
                         cfg.profile,
                         cfg.besu.container_name,
-                        _profile_output_filename(idx, name, "setup", cfg.profile.output_format),
+                        _profile_output_filename(run_id, idx, name, "setup", cfg.profile.output_format),
+                        log.root,
                         log,
                     )
                     testing_profiler = ProfilerSession(
                         cfg.profile,
                         cfg.besu.container_name,
-                        _profile_output_filename(idx, name, "testing", cfg.profile.output_format),
+                        _profile_output_filename(run_id, idx, name, "testing", cfg.profile.output_format),
+                        log.root,
                         log,
                     )
 

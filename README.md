@@ -113,10 +113,12 @@ scripts/install-async-profiler.sh
 ```
 
 Output flame graphs land in the run dir as
-`profile-0001-<slug>-setup.html` and
-`profile-0001-<slug>-testing.html` — open them in a browser. Default
-event is `wall` (per-thread, no kernel tuning needed). Edit
-`profile.event: cpu` in `config.yaml` for on-CPU flame graphs after
+`<run-id>-profile-0001-<slug>-setup.html` and
+`<run-id>-profile-0001-<slug>-testing.html` — `<run-id>` is the
+timestamp folder, so the file is self-identifying once you copy it out
+of the run dir. Open them in a browser. Default event is `wall`
+(per-thread, no kernel tuning needed). Edit `profile.event: cpu` in
+`config.yaml` for on-CPU flame graphs after
 `sudo sysctl -w kernel.perf_event_paranoid=1`.
 
 ## Troubleshooting
