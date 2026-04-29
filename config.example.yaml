@@ -176,3 +176,9 @@ profile:
   # critical path. Add e.g. `--cstack=fp` for native frames.
   extra_args:
     - -t
+
+  # asprof --log level. WARN silences "io_uring_wait_cqe failed: -4" spam
+  # that async-profiler 4.x emits whenever its sample-poll is interrupted
+  # by a signal (which happens many times per second on a busy JVM).
+  # Bump to INFO/DEBUG when investigating profiler internals.
+  log_level: warn

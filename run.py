@@ -99,6 +99,7 @@ class ProfileConfig:
     interval: str                  # asprof -i value (e.g. "1ms", "500us")
     output_format: str             # html | jfr | flamegraph (-> .html)
     extra_args: list[str]          # extra flags passed to asprof start
+    log_level: str                 # asprof --log level (TRACE..NONE), default warn
 
 
 @dataclasses.dataclass
@@ -171,6 +172,11 @@ def _load_profile(raw: dict | None) -> ProfileConfig:
         interval=str(raw.get("interval", "1ms")),
         output_format=str(raw.get("output_format", "html")),
         extra_args=list(raw.get("extra_args") or ["-t"]),
+        # async-profiler 4.x logs `io_uring_wait_cqe failed: -4` (EINTR)
+        # on every signal-interrupted poll of its sample queue. The retries
+        # are silent at WARN level. Set NONE to silence everything, INFO
+        # for the original chatty default.
+        log_level=str(raw.get("log_level", "warn")),
     )
 
 
@@ -358,6 +364,7 @@ class ProfilerSession:
         # here. If you use a different entrypoint, adjust accordingly.
         args = [
             self._asprof, "start",
+            "--log", self.cfg.log_level,
             "-e", self.cfg.event,
             "-i", self.cfg.interval,
             *self.cfg.extra_args,
@@ -384,6 +391,7 @@ class ProfilerSession:
             return
         args = [
             self._asprof, "stop",
+            "--log", self.cfg.log_level,
             "-f", self._container_output_path,
             "1",
         ]
