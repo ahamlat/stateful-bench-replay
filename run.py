@@ -512,6 +512,15 @@ def start_besu(
         "run", "-d",
         "--name", cfg.container_name,
         "--network", "host",
+        # Disable Docker's default seccomp profile. async-profiler needs
+        # perf_event_open / ptrace / mmap with PROT_EXEC for trampolines,
+        # all of which are restricted (or outright blocked) by the default
+        # profile on many distros. Even without profiling, Besu's JVM
+        # benefits from unrestricted syscalls (jvm-perf events, vmstat
+        # introspection). The container is already trusted (we built or
+        # pulled the image ourselves and run on a private bench host),
+        # so there is no security regression.
+        "--security-opt", "seccomp=unconfined",
         "-v", f"{merged}:{cfg.container_data_path}",
     ]
     if cfg.entrypoint:
