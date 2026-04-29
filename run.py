@@ -983,8 +983,32 @@ def _interactive_pick(tests: list[str], log: SweepLog) -> list[str]:
         print(f"  out of range, must be 1..{len(tests)}")
 
 
+# --- "foramez" personal helper ---------------------------------------------
+# When --foramez is passed, the runner appends ready-to-paste `scp` commands
+# at the end of the sweep so Amez can grab the flame graphs onto his laptop
+# without hand-typing the long filenames. Hard-coded on purpose: this is a
+# single-user convenience, not a generic feature.
+_FORAMEZ_REMOTE_HOST = "ahamlat@i-07c259598ca442e5a"
+_FORAMEZ_AWS_PROFILE = "protocols"
+# Backslash-escapes are intentional - they are for the user's local shell
+# when they paste the command. Python raw-string so we can keep them literal.
+_FORAMEZ_LOCAL_DEST = (
+    r"~/Documents/03\ -\ HyperLedger\ Besu/"
+    r"02\ -\ Performance\ Tests/CPU\ Profiling\ results"
+)
+
+
+def _foramez_scp_lines(profile_paths: list[Path]) -> list[str]:
+    """One scp command per flame graph, ready to copy-paste."""
+    return [
+        f"AWS_PROFILE={_FORAMEZ_AWS_PROFILE} scp "
+        f"{_FORAMEZ_REMOTE_HOST}:{p} {_FORAMEZ_LOCAL_DEST}"
+        for p in profile_paths
+    ]
+
+
 def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
-              pick: bool, dry_run: bool) -> int:
+              pick: bool, dry_run: bool, foramez: bool = False) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
@@ -1060,6 +1084,9 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 
     started_container = False
     sweep_ok = True
+    # Collected per-test flame-graph paths, used by --foramez at the end of
+    # the sweep to print scp commands.
+    profile_paths: list[Path] = []
 
     try:
         with requests.Session() as session:
@@ -1109,6 +1136,8 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                         log.root,
                         log,
                     )
+                    profile_paths.append(setup_profiler.host_output_path)
+                    profile_paths.append(testing_profiler.host_output_path)
 
                 test_ok = True
 
@@ -1161,6 +1190,18 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     break
 
         log.event(f"sweep end: ok={sweep_ok}")
+
+        if foramez and profile_paths:
+            # Print one scp command per flame graph. Logged into events.log
+            # for the record, and also echoed to stdout (without timestamp
+            # prefix) so the user can copy-paste a clean command line.
+            log.event("--- foramez: copy these to your laptop ---")
+            for line in _foramez_scp_lines(profile_paths):
+                log.event(f"  {line}")
+            print(file=sys.stderr)
+            print("# foramez: scp lines", file=sys.stderr)
+            for line in _foramez_scp_lines(profile_paths):
+                print(line)
     finally:
         log.flush_summary({
             "config": {
@@ -1200,6 +1241,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--profile", action="store_true",
                    help="enable async-profiler around the last newPayload+FCU pair "
                         "of setup/ and testing/ (overrides profile.enabled in yaml)")
+    p.add_argument("--foramez", action="store_true",
+                   help="(personal) at end of run, print scp commands to download "
+                        "the flame graphs to ahamlat's laptop")
     return p.parse_args(argv)
 
 
@@ -1217,7 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.profile.enabled = True
     _install_sigint_handler()
     return run_sweep(cfg, filter_override=args.filter, limit=args.limit,
-                     pick=args.pick, dry_run=args.dry_run)
+                     pick=args.pick, dry_run=args.dry_run,
+                     foramez=args.foramez)
 
 
 if __name__ == "__main__":
