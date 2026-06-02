@@ -150,28 +150,48 @@ the per-test testing-block time.
 ```
 
 For each version the runner does the normal per-test flow (reset overlay →
-start Besu → prelude → `setup/<name>.txt` → `testing/<name>.txt` → stop), but
-the **testing phase is timed**. The headline metric per test is the
-wall-clock latency of the **last `engine_newPayload`** in
-`testing/<name>.txt` — i.e. the measured heavy block.
+start Besu → prelude → `setup/<name>.txt` → `testing/<name>.txt` → stop). It
+then compares **only the last imported (measured) block** of each test,
+using Besu's *own* numbers parsed from the `Imported #…` log line:
+
+- **gas used** — deterministic, so identical for *x* and *y* (a `⚠` flags
+  any mismatch);
+- **Mgas/s** — throughput, the headline metric;
+- **latency** — Besu's block `exec` time, in ms.
 
 Results land in `runs/<timestamp>-compare/`:
 
 ```
-comparison.html         # side-by-side table, sortable, regressions on top
+comparison.html         # sortable table: gas, Mgas/s (x/y/Δ/Δ%), latency (x/y/Δ)
 comparison.json         # same data, machine-readable
 selected_tests.txt      # the resolved test list (shared by both versions)
-besu-<label>-NNNN-*.log # per-version, per-test Besu logs
+besu-<label>-NNNN-*.log # per-version, per-test Besu logs (source of the numbers)
 events.log              # full timeline of both runs
 summary.json            # per-version ok/fail tallies + comparison summary
 ```
 
-Open `comparison.html` in any browser (no external assets). Green rows are
-where *y* is faster than *x*, red where *y* is slower; the summary cards at
-the top show the overall delta and how many tests got faster / slower.
+Open `comparison.html` in any browser (no external assets). Rows are sorted
+worst-throughput-regression first; green = *y* faster (higher Mgas/s) than
+*x*, red = *y* slower. The summary cards show each version's aggregate
+Mgas/s and the overall throughput delta.
 
 `--compare --dry-run` resolves the test list and config without starting
 any container, exactly like the normal `--dry-run`.
+
+### Rebuild a report without re-running
+
+The per-test Besu logs already contain every `Imported #` line, so you can
+regenerate `comparison.html` / `comparison.json` from a finished run's logs
+without replaying anything (handy after a report-format change, or to
+upgrade a report produced by an older version of the script):
+
+```bash
+./runBenchmark.sh --rebuild-report runs/20260602-124513-compare
+```
+
+It reads `summary.json` (for the two image labels) and `selected_tests.txt`
+(for the ordered test list), re-parses the `besu-<label>-NNNN-*.log` files,
+and overwrites the two `comparison.*` artefacts in place. No config needed.
 
 ## Troubleshooting
 

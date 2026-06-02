@@ -34,6 +34,7 @@ import fnmatch
 import json
 import os
 import random
+import re
 import shutil
 import shlex
 import signal
@@ -1218,6 +1219,60 @@ def _safe_label(label: str) -> str:
     return "".join(out).strip("-") or "ver"
 
 
+# Besu logs one line per imported block, e.g.:
+#   ... | AbstractEngineNewPayload | Imported #24,407,731  (fbdc2..26565)|
+#       18 tx (100.0% parallel)| 0 ws| 0 blobs| 7 wei bfee|
+#       299,371,362 (  0.0%) gas used| 1.090s exec| 274.70 Mgas/s| 0 peers
+# We parse Besu's own gas-used / exec-time / Mgas/s straight from that line
+# rather than recomputing them, so the numbers match what Besu reports.
+_IMPORTED_BLOCK_RE = re.compile(r"Imported\s+#([\d,]+)")
+_IMPORTED_GAS_RE = re.compile(r"([\d,]+)\s*\(\s*[\d.]+%\)\s*gas used")
+_IMPORTED_EXEC_RE = re.compile(r"([\d.]+)\s*s\s*exec")
+_IMPORTED_MGAS_RE = re.compile(r"([\d.]+)\s*Mgas/s")
+
+
+def _parse_imported_line(line: str) -> dict | None:
+    """Extract {block, gas_used, exec_s, mgas_s} from one Besu 'Imported #'
+    log line. Returns None if the line is not a block-import line."""
+    m_blk = _IMPORTED_BLOCK_RE.search(line)
+    if not m_blk:
+        return None
+    m_gas = _IMPORTED_GAS_RE.search(line)
+    m_exec = _IMPORTED_EXEC_RE.search(line)
+    m_mgas = _IMPORTED_MGAS_RE.search(line)
+
+    def _int(s: str) -> int:
+        return int(s.replace(",", ""))
+
+    return {
+        "block": _int(m_blk.group(1)),
+        "gas_used": (_int(m_gas.group(1)) if m_gas else None),
+        "exec_s": (float(m_exec.group(1)) if m_exec else None),
+        "mgas_s": (float(m_mgas.group(1)) if m_mgas else None),
+    }
+
+
+def _parse_last_imported(log_path: Path) -> dict | None:
+    """Metrics for the LAST 'Imported #' block in a Besu container log.
+
+    Testing is the final phase of each test, so the last imported block is
+    exactly the measured block we want to compare ("compare only the last
+    block"). Returns None if no import line is found.
+    """
+    last: dict | None = None
+    try:
+        with log_path.open("r", errors="replace") as fh:
+            for line in fh:
+                if "Imported #" not in line:
+                    continue
+                parsed = _parse_imported_line(line)
+                if parsed:
+                    last = parsed
+    except OSError:
+        return None
+    return last
+
+
 def _replay_file_measure(
     cfg: Config,
     secret: bytes,
@@ -1365,25 +1420,35 @@ def _run_version(
                         if not t_ok:
                             test_ok = False
 
-                save_container_logs(
-                    cfg.besu.container_name,
+                besu_log_path = (
                     log.root / f"besu-{_safe_label(label)}-{idx:04d}-"
-                               f"{_slugify(name)}{'' if test_ok else '-FAIL'}.log",
-                    log,
+                               f"{_slugify(name)}{'' if test_ok else '-FAIL'}.log"
                 )
+                save_container_logs(cfg.besu.container_name, besu_log_path, log)
                 stop_container(cfg.besu.container_name)
                 started_container = False
 
+                # Pull gas-used / exec-time / Mgas/s straight from Besu's own
+                # "Imported #" line for the last (measured) block.
+                imported = _parse_last_imported(besu_log_path)
+                if imported:
+                    log.event(
+                        f"[{label}] {name}: block #{imported['block']:,} "
+                        f"gas={imported['gas_used']:,} "
+                        f"exec={imported['exec_s']}s mgas/s={imported['mgas_s']}"
+                    )
+                else:
+                    log.event(f"[{label}] {name}: no 'Imported #' line in besu log")
+
                 results[name] = {
                     "ok": test_ok,
+                    "block": imported["block"] if imported else None,
+                    "gas_used": imported["gas_used"] if imported else None,
+                    "exec_s": imported["exec_s"] if imported else None,
+                    "mgas_s": imported["mgas_s"] if imported else None,
+                    # Python-side timing kept as a fallback latency source.
                     "last_newpayload_ms": (
                         testing_metrics["last_newpayload_ms"] if testing_metrics else None
-                    ),
-                    "total_newpayload_ms": (
-                        testing_metrics["total_newpayload_ms"] if testing_metrics else None
-                    ),
-                    "newpayload_ms": (
-                        testing_metrics["newpayload_ms"] if testing_metrics else []
                     ),
                 }
 
@@ -1398,6 +1463,16 @@ def _run_version(
     return results
 
 
+def _latency_ms(r: dict) -> float | None:
+    """Per-test latency in ms. Prefer Besu's own block exec time (exec_s);
+    fall back to the Python-side newPayload timing if the log had no exec."""
+    e = r.get("exec_s")
+    if isinstance(e, (int, float)):
+        return e * 1000.0
+    ms = r.get("last_newpayload_ms")
+    return ms if isinstance(ms, (int, float)) else None
+
+
 def _build_comparison(
     label_x: str, image_x: str, results_x: dict[str, dict],
     label_y: str, image_y: str, results_y: dict[str, dict],
@@ -1405,20 +1480,25 @@ def _build_comparison(
 ) -> dict:
     """Join the two per-version result dicts into a comparison structure.
 
-    Headline metric is `last_newpayload_ms` (the measured testing block).
-    delta_ms = y - x (positive => y slower), delta_pct relative to x.
+    For each test we compare the LAST imported (measured) block:
+      - gas used (deterministic, so identical for x and y),
+      - Mgas/s throughput (Besu-reported),
+      - latency = Besu block exec time, in ms.
+
+    Throughput is the headline: delta_mgas_pct = (y/x - 1) * 100, so a
+    positive value means y is faster (higher Mgas/s).
     """
     rows: list[dict] = []
-    x_total = 0.0
-    y_total = 0.0
+    total_gas = 0
+    x_total_exec_s = 0.0
+    y_total_exec_s = 0.0
     faster = slower = same = 0
     x_failures = y_failures = 0
+    gas_mismatches = 0
 
     for name in tests:
         rx = results_x.get(name, {})
         ry = results_y.get(name, {})
-        x_ms = rx.get("last_newpayload_ms")
-        y_ms = ry.get("last_newpayload_ms")
         x_ok = bool(rx.get("ok"))
         y_ok = bool(ry.get("ok"))
         if not x_ok:
@@ -1426,48 +1506,90 @@ def _build_comparison(
         if not y_ok:
             y_failures += 1
 
-        delta_ms = delta_pct = None
-        if isinstance(x_ms, (int, float)) and isinstance(y_ms, (int, float)):
-            x_total += x_ms
-            y_total += y_ms
-            delta_ms = y_ms - x_ms
-            delta_pct = (delta_ms / x_ms * 100.0) if x_ms else None
-            if delta_pct is None:
-                same += 1
-            elif delta_pct < -1.0:
+        gas_x = rx.get("gas_used")
+        gas_y = ry.get("gas_used")
+        gas_used = gas_x if isinstance(gas_x, (int, float)) else gas_y
+        gas_match = (
+            isinstance(gas_x, (int, float)) and isinstance(gas_y, (int, float))
+            and gas_x == gas_y
+        )
+        if (isinstance(gas_x, (int, float)) and isinstance(gas_y, (int, float))
+                and gas_x != gas_y):
+            gas_mismatches += 1
+
+        x_mgas = rx.get("mgas_s")
+        y_mgas = ry.get("mgas_s")
+        x_lat = _latency_ms(rx)
+        y_lat = _latency_ms(ry)
+
+        delta_mgas = delta_mgas_pct = None
+        if isinstance(x_mgas, (int, float)) and isinstance(y_mgas, (int, float)):
+            delta_mgas = y_mgas - x_mgas
+            delta_mgas_pct = (delta_mgas / x_mgas * 100.0) if x_mgas else None
+
+        delta_lat_ms = delta_lat_pct = None
+        if isinstance(x_lat, (int, float)) and isinstance(y_lat, (int, float)):
+            delta_lat_ms = y_lat - x_lat
+            delta_lat_pct = (delta_lat_ms / x_lat * 100.0) if x_lat else None
+
+        # Aggregate only when both versions reported a usable block.
+        x_exec = rx.get("exec_s")
+        y_exec = ry.get("exec_s")
+        if (isinstance(gas_used, (int, float))
+                and isinstance(x_exec, (int, float))
+                and isinstance(y_exec, (int, float))):
+            total_gas += gas_used
+            x_total_exec_s += x_exec
+            y_total_exec_s += y_exec
+
+        if isinstance(delta_mgas_pct, (int, float)):
+            if delta_mgas_pct > 1.0:
                 faster += 1
-            elif delta_pct > 1.0:
+            elif delta_mgas_pct < -1.0:
                 slower += 1
             else:
                 same += 1
 
         rows.append({
             "test": name,
-            "x_ms": x_ms, "y_ms": y_ms,
             "x_ok": x_ok, "y_ok": y_ok,
-            "delta_ms": delta_ms, "delta_pct": delta_pct,
+            "gas_used": gas_used, "gas_match": gas_match,
+            "x_mgas": x_mgas, "y_mgas": y_mgas,
+            "delta_mgas": delta_mgas, "delta_mgas_pct": delta_mgas_pct,
+            "x_lat_ms": x_lat, "y_lat_ms": y_lat,
+            "delta_lat_ms": delta_lat_ms, "delta_lat_pct": delta_lat_pct,
         })
 
-    overall_pct = ((y_total - x_total) / x_total * 100.0) if x_total else None
+    x_agg_mgas = (total_gas / 1e6 / x_total_exec_s) if x_total_exec_s else None
+    y_agg_mgas = (total_gas / 1e6 / y_total_exec_s) if y_total_exec_s else None
+    overall_mgas_pct = (
+        (y_agg_mgas - x_agg_mgas) / x_agg_mgas * 100.0
+        if (x_agg_mgas and y_agg_mgas) else None
+    )
     return {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
-        "metric": "last_newpayload_ms",
-        "metric_desc": "wall-clock latency of the last engine_newPayload in "
-                       "testing/<name>.txt (the measured heavy block), in ms",
+        "metric": "mgas_s",
+        "metric_desc": "Besu-reported gas used, Mgas/s throughput and block "
+                       "exec latency of the last imported (measured) block, "
+                       "parsed from the per-test container log",
         "version_x": {"label": label_x, "image": image_x},
         "version_y": {"label": label_y, "image": image_y},
         "rows": rows,
         "summary": {
             "tests": len(tests),
             "compared": faster + slower + same,
-            "x_total_ms": x_total,
-            "y_total_ms": y_total,
-            "overall_delta_pct": overall_pct,
+            "total_gas": total_gas,
+            "x_total_exec_s": x_total_exec_s,
+            "y_total_exec_s": y_total_exec_s,
+            "x_agg_mgas_s": x_agg_mgas,
+            "y_agg_mgas_s": y_agg_mgas,
+            "overall_mgas_pct": overall_mgas_pct,
             "y_faster": faster,
             "y_slower": slower,
             "neutral": same,
             "x_failures": x_failures,
             "y_failures": y_failures,
+            "gas_mismatches": gas_mismatches,
         },
     }
 
@@ -1478,6 +1600,19 @@ def _fmt_ms(v) -> str:
     return f"{v:,.1f}"
 
 
+def _fmt_mgas(v) -> str:
+    if not isinstance(v, (int, float)):
+        return "n/a"
+    return f"{v:,.2f}"
+
+
+def _fmt_gas_m(v) -> str:
+    """Gas used rendered in millions of gas (Mgas)."""
+    if not isinstance(v, (int, float)):
+        return "n/a"
+    return f"{v / 1e6:,.1f}M"
+
+
 def _fmt_pct(v) -> str:
     if not isinstance(v, (int, float)):
         return "n/a"
@@ -1486,49 +1621,70 @@ def _fmt_pct(v) -> str:
 
 def _render_comparison_html(cmp: dict) -> str:
     """Self-contained HTML report (embedded CSS + a little vanilla JS for
-    column sorting). No external assets, so it opens fine after `scp`."""
+    column sorting). No external assets, so it opens fine after `scp`.
+
+    Headline is Mgas/s throughput on the last imported block; gas used is
+    shown once (identical for both versions) and latency (block exec time)
+    is shown per version with its delta.
+    """
     import html as _html
 
     vx, vy = cmp["version_x"], cmp["version_y"]
     s = cmp["summary"]
 
-    def _cls(delta_pct):
-        if not isinstance(delta_pct, (int, float)):
+    def _tput_cls(pct):
+        """Colour by throughput delta: y higher Mgas/s => faster => green."""
+        if not isinstance(pct, (int, float)):
             return "na"
-        if delta_pct < -1.0:
+        if pct > 1.0:
             return "faster"
-        if delta_pct > 1.0:
+        if pct < -1.0:
             return "slower"
         return "neutral"
 
-    # Sort rows worst-regression-first so problems are at the top; tests with
-    # no comparable number sink to the bottom.
+    # Worst throughput regression first (most negative delta on top); tests
+    # with no comparable number sink to the bottom.
     def _sort_key(r):
-        d = r["delta_pct"]
-        return (-d if isinstance(d, (int, float)) else float("inf"),)
+        d = r["delta_mgas_pct"]
+        return (d if isinstance(d, (int, float)) else float("inf"),)
     rows = sorted(cmp["rows"], key=_sort_key)
 
     body_rows = []
     for r in rows:
-        cls = _cls(r["delta_pct"])
-        d_ms = r["delta_ms"]
+        cls = _tput_cls(r["delta_mgas_pct"])
+        d_mgas = r["delta_mgas"]
+        d_lat = r["delta_lat_ms"]
+        gas_txt = _fmt_gas_m(r["gas_used"])
+        if not r["gas_match"] and isinstance(r["gas_used"], (int, float)):
+            gas_txt += " &#9888;"  # gas differed between x and y
         body_rows.append(
             "<tr class='{cls}'>"
             "<td class='test' title='{full}'><code>{test}</code></td>"
-            "<td class='num'>{x}</td>"
-            "<td class='num'>{y}</td>"
-            "<td class='num delta' data-sort='{dsort}'>{dms}</td>"
-            "<td class='num pct'>{dpct}</td>"
+            "<td class='num gas'>{gas}</td>"
+            "<td class='num'>{xm}</td>"
+            "<td class='num'>{ym}</td>"
+            "<td class='num delta' data-sort='{dms_sort}'>{dmgas}</td>"
+            "<td class='num pct' data-sort='{dpct_sort}'>{dmgaspct}</td>"
+            "<td class='num lat'>{xl}</td>"
+            "<td class='num lat'>{yl}</td>"
+            "<td class='num latdelta' data-sort='{dlat_sort}'>{dlat}</td>"
             "<td class='status'>{stat}</td>"
             "</tr>".format(
                 cls=cls,
                 full=_html.escape(r["test"]),
                 test=_html.escape(r["test"]),
-                x=_fmt_ms(r["x_ms"]),
-                y=_fmt_ms(r["y_ms"]),
-                dsort=(d_ms if isinstance(d_ms, (int, float)) else 1e18),
-                dms=(f"{d_ms:+,.1f}" if isinstance(d_ms, (int, float)) else "n/a"),
-                dpct=_fmt_pct(r["delta_pct"]),
+                gas=gas_txt,
+                xm=_fmt_mgas(r["x_mgas"]),
+                ym=_fmt_mgas(r["y_mgas"]),
+                dms_sort=(d_mgas if isinstance(d_mgas, (int, float)) else -1e18),
+                dmgas=(f"{d_mgas:+,.2f}" if isinstance(d_mgas, (int, float)) else "n/a"),
+                dpct_sort=(r["delta_mgas_pct"]
+                           if isinstance(r["delta_mgas_pct"], (int, float)) else -1e18),
+                dmgaspct=_fmt_pct(r["delta_mgas_pct"]),
+                xl=_fmt_ms(r["x_lat_ms"]),
+                yl=_fmt_ms(r["y_lat_ms"]),
+                dlat_sort=(d_lat if isinstance(d_lat, (int, float)) else 1e18),
+                dlat=(f"{d_lat:+,.1f}" if isinstance(d_lat, (int, float)) else "n/a"),
                 stat=("ok" if (r["x_ok"] and r["y_ok"])
                       else "fail x" if not r["x_ok"] and r["y_ok"]
                       else "fail y" if r["x_ok"] and not r["y_ok"]
@@ -1536,8 +1692,8 @@ def _render_comparison_html(cmp: dict) -> str:
             )
         )
 
-    overall = s["overall_delta_pct"]
-    overall_cls = _cls(overall)
+    overall = s["overall_mgas_pct"]
+    overall_cls = _tput_cls(overall)
     overall_txt = _fmt_pct(overall) if isinstance(overall, (int, float)) else "n/a"
 
     return """<!doctype html>
@@ -1565,6 +1721,8 @@ def _render_comparison_html(cmp: dict) -> str:
   th {{ background: #1b2030; cursor: pointer; user-select: none; position: sticky; top: 0; }}
   th:hover {{ background: #222a3d; }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.gas {{ color: #cdd6f4; }}
+  td.lat, td.latdelta {{ color: #9aa4b2; }}
   td.test code {{ color: #cdd6f4; word-break: break-all; }}
   tr.faster td.pct, tr.faster td.delta {{ color: #51cf66; }}
   tr.slower td.pct, tr.slower td.delta {{ color: #ff6b6b; }}
@@ -1584,7 +1742,9 @@ def _render_comparison_html(cmp: dict) -> str:
 
   <div class="cards">
     <div class="card"><div class="k">Tests compared</div><div class="v">{compared}/{tests}</div></div>
-    <div class="card"><div class="k">Overall (sum y vs x)</div><div class="v {ocls}">{overall}</div></div>
+    <div class="card"><div class="k">Overall throughput (y vs x)</div><div class="v {ocls}">{overall}</div></div>
+    <div class="card"><div class="k">x aggregate Mgas/s</div><div class="v na">{xagg}</div></div>
+    <div class="card"><div class="k">y aggregate Mgas/s</div><div class="v na">{yagg}</div></div>
     <div class="card"><div class="k">y faster</div><div class="v faster">{faster}</div></div>
     <div class="card"><div class="k">y slower</div><div class="v slower">{slower}</div></div>
     <div class="card"><div class="k">neutral (&lt;1%)</div><div class="v neutral">{neutral}</div></div>
@@ -1594,11 +1754,15 @@ def _render_comparison_html(cmp: dict) -> str:
   <table id="cmp">
     <thead><tr>
       <th data-col="0" data-type="str">Test</th>
-      <th data-col="1" data-type="num">x · {lx} (ms)</th>
-      <th data-col="2" data-type="num">y · {ly} (ms)</th>
-      <th data-col="3" data-type="num">&#916; ms (y-x)</th>
-      <th data-col="4" data-type="num">&#916; %</th>
-      <th data-col="5" data-type="str">status</th>
+      <th data-col="1" data-type="num">Gas used</th>
+      <th data-col="2" data-type="num">x &middot; {lx} (Mgas/s)</th>
+      <th data-col="3" data-type="num">y &middot; {ly} (Mgas/s)</th>
+      <th data-col="4" data-type="num">&#916; Mgas/s</th>
+      <th data-col="5" data-type="num">&#916; % tput</th>
+      <th data-col="6" data-type="num">x lat (ms)</th>
+      <th data-col="7" data-type="num">y lat (ms)</th>
+      <th data-col="8" data-type="num">&#916; lat (ms)</th>
+      <th data-col="9" data-type="str">status</th>
     </tr></thead>
     <tbody>
       {rows}
@@ -1606,8 +1770,11 @@ def _render_comparison_html(cmp: dict) -> str:
   </table>
 
   <div class="legend">
-    Rows are sorted worst-regression-first. Green = y faster than x, red = y slower.
-    Click a column header to re-sort. &Delta;% is relative to x.
+    One row per test = the last imported (measured) block. Gas used is
+    identical across versions (&#9888; flags a mismatch). Throughput
+    (Mgas/s) and latency are Besu's own reported numbers. Rows are sorted
+    worst throughput regression first. Green = y faster than x, red = y
+    slower. &Delta;% tput is relative to x; click a header to re-sort.
   </div>
 
 <script>
@@ -1618,7 +1785,7 @@ def _render_comparison_html(cmp: dict) -> str:
   function val(td, type) {{
     if (td && td.dataset && td.dataset.sort !== undefined) return parseFloat(td.dataset.sort);
     var t = td ? td.textContent.trim() : '';
-    if (type === 'num') {{ var n = parseFloat(t.replace(/[,%+]/g, '')); return isNaN(n) ? Infinity : n; }}
+    if (type === 'num') {{ var n = parseFloat(t.replace(/[,%+M]/g, '')); return isNaN(n) ? Infinity : n; }}
     return t.toLowerCase();
   }}
   Array.prototype.forEach.call(table.tHead.rows[0].cells, function (th) {{
@@ -1645,10 +1812,11 @@ def _render_comparison_html(cmp: dict) -> str:
         gen=_html.escape(cmp["generated_at"]),
         compared=s["compared"], tests=s["tests"],
         overall=overall_txt, ocls=overall_cls,
+        xagg=_fmt_mgas(s["x_agg_mgas_s"]), yagg=_fmt_mgas(s["y_agg_mgas_s"]),
         faster=s["y_faster"], slower=s["y_slower"], neutral=s["neutral"],
         xf=s["x_failures"], yf=s["y_failures"],
         rows="\n      ".join(body_rows) if body_rows else
-             "<tr><td colspan='6'>no tests</td></tr>",
+             "<tr><td colspan='10'>no tests</td></tr>",
     )
 
 
@@ -1765,6 +1933,79 @@ def run_compare(
     return 0
 
 
+def rebuild_report(run_dir: Path) -> int:
+    """Regenerate comparison.html + comparison.json from an existing compare
+    run's saved Besu logs, WITHOUT re-running anything.
+
+    Useful after changing the report format, or to upgrade a report produced
+    by an older version of this script: the per-test container logs already
+    contain Besu's `Imported #` lines, so gas / Mgas/s / latency can be
+    re-extracted on the spot.
+
+    Reads `summary.json` (for the two version labels + images) and
+    `selected_tests.txt` (for the ordered test list), then matches each test
+    to its `besu-<label>-NNNN-*.log` file by index.
+    """
+    run_dir = _abs_path(run_dir)
+    summary_path = run_dir / "summary.json"
+    selected_path = run_dir / "selected_tests.txt"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"no summary.json in {run_dir}")
+    if not selected_path.is_file():
+        raise FileNotFoundError(f"no selected_tests.txt in {run_dir}")
+
+    summ = json.loads(summary_path.read_text())
+    vx = summ.get("version_x") or {}
+    vy = summ.get("version_y") or {}
+    label_x = vx.get("label", "x")
+    image_x = vx.get("image", "?")
+    label_y = vy.get("label", "y")
+    image_y = vy.get("image", "?")
+    tests = [ln for ln in selected_path.read_text().splitlines() if ln.strip()]
+
+    def _collect(label: str) -> dict[str, dict]:
+        res: dict[str, dict] = {}
+        sl = _safe_label(label)
+        for idx, name in enumerate(tests, start=1):
+            matches = sorted(run_dir.glob(f"besu-{sl}-{idx:04d}-*.log"))
+            parsed = None
+            failed = False
+            for mpath in matches:
+                if mpath.name.endswith("-FAIL.log"):
+                    failed = True
+                p = _parse_last_imported(mpath)
+                if p:
+                    parsed = p
+            res[name] = {
+                "ok": (not failed) and parsed is not None,
+                "block": parsed["block"] if parsed else None,
+                "gas_used": parsed["gas_used"] if parsed else None,
+                "exec_s": parsed["exec_s"] if parsed else None,
+                "mgas_s": parsed["mgas_s"] if parsed else None,
+                "last_newpayload_ms": None,
+            }
+        return res
+
+    comparison = _build_comparison(
+        label_x, image_x, _collect(label_x),
+        label_y, image_y, _collect(label_y),
+        tests,
+    )
+    json_path = run_dir / "comparison.json"
+    html_path = run_dir / "comparison.html"
+    json_path.write_text(json.dumps(comparison, indent=2))
+    html_path.write_text(_render_comparison_html(comparison))
+
+    sm = comparison["summary"]
+    print(f"Rebuilt report from {run_dir}:\n  {html_path}\n  {json_path}")
+    print(f"  y faster on {sm['y_faster']} / slower on {sm['y_slower']} / "
+          f"neutral {sm['neutral']} (of {sm['compared']} compared).")
+    if sm["gas_mismatches"]:
+        print(f"  warning: {sm['gas_mismatches']} test(s) had differing gas "
+              "used between x and y.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1798,6 +2039,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="compare mode: display label for image-x (default: the image tag)")
     p.add_argument("--label-y", default=None,
                    help="compare mode: display label for image-y (default: the image tag)")
+    p.add_argument("--rebuild-report", default=None, metavar="RUN_DIR",
+                   help="regenerate comparison.html/json from an existing "
+                        "runs/<ts>-compare dir's saved Besu logs, without "
+                        "re-running anything (no config needed)")
     return p.parse_args(argv)
 
 
@@ -1810,6 +2055,11 @@ def _install_sigint_handler() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Report rebuild reads only the existing run dir; no config required.
+    if args.rebuild_report:
+        return rebuild_report(_abs_path(args.rebuild_report))
+
     cfg = load_config(_abs_path(args.config))
     if args.profile:
         cfg.profile.enabled = True
