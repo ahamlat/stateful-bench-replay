@@ -127,6 +127,52 @@ plate parameters stripped (`fork_Amsterdam`, `benchmark_test`,
 `config.yaml` for on-CPU flame graphs after
 `sudo sysctl -w kernel.perf_event_paranoid=1`.
 
+## 6. Compare two Besu versions (optional)
+
+`--compare` runs the **whole selected suite twice** — once on image *x*,
+then once on image *y* — and writes a self-contained HTML report diffing
+the per-test testing-block time.
+
+```bash
+# Compare two images on a single test (quick smoke test of the mode).
+./runBenchmark.sh --compare \
+    --image-x ethpandaops/besu:bal-devnet-2 \
+    --image-y ethpandaops/besu:bal-devnet-3 \
+    --filter '*sload_bloated*' --limit 1
+
+# x defaults to besu.image from config.yaml, so you usually only pass y:
+./runBenchmark.sh --compare --image-y ethpandaops/besu:my-branch
+
+# Give the columns friendly names instead of the image tag.
+./runBenchmark.sh --compare \
+    --image-y ethpandaops/besu:my-branch \
+    --label-x main --label-y my-branch
+```
+
+For each version the runner does the normal per-test flow (reset overlay →
+start Besu → prelude → `setup/<name>.txt` → `testing/<name>.txt` → stop), but
+the **testing phase is timed**. The headline metric per test is the
+wall-clock latency of the **last `engine_newPayload`** in
+`testing/<name>.txt` — i.e. the measured heavy block.
+
+Results land in `runs/<timestamp>-compare/`:
+
+```
+comparison.html         # side-by-side table, sortable, regressions on top
+comparison.json         # same data, machine-readable
+selected_tests.txt      # the resolved test list (shared by both versions)
+besu-<label>-NNNN-*.log # per-version, per-test Besu logs
+events.log              # full timeline of both runs
+summary.json            # per-version ok/fail tallies + comparison summary
+```
+
+Open `comparison.html` in any browser (no external assets). Green rows are
+where *y* is faster than *x*, red where *y* is slower; the summary cards at
+the top show the overall delta and how many tests got faster / slower.
+
+`--compare --dry-run` resolves the test list and config without starting
+any container, exactly like the normal `--dry-run`.
+
 ## Troubleshooting
 
 - **`docker logs besu-bench` is empty for minutes after start**: the

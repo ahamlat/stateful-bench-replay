@@ -19,6 +19,10 @@ Per sweep:
 Usage:
     python3 run.py --config config.yaml [--filter '*BALANCE*'] [--limit 1] [--dry-run]
 
+Compare mode (run the suite on two Besu images and diff the testing-block
+times into an HTML report under runs/<ts>-compare/):
+    python3 run.py --compare --image-x <imgX> --image-y <imgY> [--filter ...]
+
 See config.example.yaml for the schema.
 """
 from __future__ import annotations
@@ -983,32 +987,8 @@ def _interactive_pick(tests: list[str], log: SweepLog) -> list[str]:
         print(f"  out of range, must be 1..{len(tests)}")
 
 
-# --- "foramez" personal helper ---------------------------------------------
-# When --foramez is passed, the runner appends ready-to-paste `scp` commands
-# at the end of the sweep so Amez can grab the flame graphs onto his laptop
-# without hand-typing the long filenames. Hard-coded on purpose: this is a
-# single-user convenience, not a generic feature.
-_FORAMEZ_REMOTE_HOST = "ahamlat@i-07c259598ca442e5a"
-_FORAMEZ_AWS_PROFILE = "protocols"
-# Backslash-escapes are intentional - they are for the user's local shell
-# when they paste the command. Python raw-string so we can keep them literal.
-_FORAMEZ_LOCAL_DEST = (
-    r"~/Documents/03\ -\ HyperLedger\ Besu/"
-    r"02\ -\ Performance\ Tests/CPU\ Profiling\ results"
-)
-
-
-def _foramez_scp_lines(profile_paths: list[Path]) -> list[str]:
-    """One scp command per flame graph, ready to copy-paste."""
-    return [
-        f"AWS_PROFILE={_FORAMEZ_AWS_PROFILE} scp "
-        f"{_FORAMEZ_REMOTE_HOST}:{p} {_FORAMEZ_LOCAL_DEST}"
-        for p in profile_paths
-    ]
-
-
 def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
-              pick: bool, dry_run: bool, foramez: bool = False) -> int:
+              pick: bool, dry_run: bool) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
@@ -1084,9 +1064,6 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 
     started_container = False
     sweep_ok = True
-    # Collected per-test flame-graph paths, used by --foramez at the end of
-    # the sweep to print scp commands.
-    profile_paths: list[Path] = []
 
     try:
         with requests.Session() as session:
@@ -1136,8 +1113,6 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                         log.root,
                         log,
                     )
-                    profile_paths.append(setup_profiler.host_output_path)
-                    profile_paths.append(testing_profiler.host_output_path)
 
                 test_ok = True
 
@@ -1190,18 +1165,6 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     break
 
         log.event(f"sweep end: ok={sweep_ok}")
-
-        if foramez and profile_paths:
-            # Print one scp command per flame graph. Logged into events.log
-            # for the record, and also echoed to stdout (without timestamp
-            # prefix) so the user can copy-paste a clean command line.
-            log.event("--- foramez: copy these to your laptop ---")
-            for line in _foramez_scp_lines(profile_paths):
-                log.event(f"  {line}")
-            print(file=sys.stderr)
-            print("# foramez: scp lines", file=sys.stderr)
-            for line in _foramez_scp_lines(profile_paths):
-                print(line)
     finally:
         log.flush_summary({
             "config": {
@@ -1223,6 +1186,585 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     return 0 if sweep_ok else 1
 
 
+# ===========================================================================
+# Compare mode: run the whole suite twice on two Besu images, then diff the
+# per-test testing-block times and emit an HTML report.
+#
+# This whole section is additive: it reuses the existing helpers (start_besu,
+# overlay_reset_all, wait_for_engine, post_engine_line, _classify, _scan_lines,
+# discover_tests, SweepLog, ...) without modifying any of them, so the default
+# single-image sweep keeps behaving exactly as before.
+# ===========================================================================
+
+def _image_label(image: str) -> str:
+    """Human-friendly label for a docker image reference.
+
+    `repo/besu:bal-devnet-2` -> `bal-devnet-2`; falls back to the whole
+    reference when there is no tag.
+    """
+    ref = image.strip()
+    # Drop a digest if present (`image@sha256:...`).
+    ref = ref.split("@", 1)[0]
+    if ":" in ref.rsplit("/", 1)[-1]:
+        return ref.rsplit(":", 1)[1]
+    return ref
+
+
+def _safe_label(label: str) -> str:
+    """Filename-safe form of a version label (for per-version artefacts)."""
+    out = []
+    for ch in label:
+        out.append(ch if (ch.isalnum() or ch in "._-") else "-")
+    return "".join(out).strip("-") or "ver"
+
+
+def _replay_file_measure(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    file_path: Path,
+    log: SweepLog,
+    *,
+    source_label: str,
+    phase: str | None = None,
+) -> tuple[bool, dict]:
+    """Timed sibling of `replay_file`, used only by compare mode.
+
+    Re-uses `_scan_lines`, `post_engine_line` and `_classify` unchanged. On
+    top of the normal ok/fail bookkeeping it times every Engine-API call and
+    returns the per-call latencies in milliseconds:
+
+        {"newpayload_ms": [...], "fcu_ms": [...],
+         "last_newpayload_ms": float | None, "total_newpayload_ms": float}
+
+    The LAST newPayload latency is the headline number: in a
+    testing/<name>.txt file it is the single measured heavy block, which is
+    exactly what we want to compare between two Besu versions.
+
+    `source_label` is the bucket name used for SweepLog counters; in compare
+    mode we prefix it with the version label so each version keeps its own
+    ok/fail tallies in summary.json.
+    """
+    label = file_path.name
+    prefix = f"replay [{phase}] " if phase else "replay "
+    log.event(f"{prefix}{label}")
+
+    items = _scan_lines(file_path)
+    np_ms: list[float] = []
+    fcu_ms: list[float] = []
+    ok_all = True
+
+    for line_no, method, raw in items:
+        if not method:
+            log.record_fail(source_label, line_no, "bad_json", {})
+            ok_all = False
+            if cfg.run.fail_fast:
+                break
+            continue
+
+        t0 = time.perf_counter()
+        status, body, err = post_engine_line(cfg, secret, session, raw)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        if err is not None and body is None:
+            log.record_fail(source_label, line_no, "http_error",
+                            {"method": method, "error": err})
+            ok_all = False
+            if cfg.run.fail_fast:
+                break
+            continue
+        if status != 200:
+            log.record_fail(source_label, line_no, "http_status",
+                            {"method": method, "status": status,
+                             "body": json.dumps(body) if body is not None else err})
+            ok_all = False
+            if cfg.run.fail_fast:
+                break
+            continue
+
+        ok, kind, detail = _classify(method, body or {})
+        if ok:
+            log.record_ok(source_label)
+        else:
+            log.record_fail(source_label, line_no, kind, {"method": method, **detail})
+            ok_all = False
+
+        if method.startswith("engine_newPayload"):
+            np_ms.append(elapsed_ms)
+        elif method.startswith("engine_forkchoiceUpdated"):
+            fcu_ms.append(elapsed_ms)
+
+        if not ok and cfg.run.fail_fast:
+            break
+
+    return ok_all, {
+        "newpayload_ms": np_ms,
+        "fcu_ms": fcu_ms,
+        "last_newpayload_ms": (np_ms[-1] if np_ms else None),
+        "total_newpayload_ms": (sum(np_ms) if np_ms else 0.0),
+    }
+
+
+def _run_version(
+    cfg: Config,
+    label: str,
+    secret: bytes,
+    tests: list[str],
+    setup_dir: Path,
+    testing_dir: Path,
+    log: SweepLog,
+) -> dict[str, dict]:
+    """Run every selected test once against `cfg.besu.image`, timing the
+    testing phase. Returns {test_name: per-test metrics}.
+
+    Mirrors the per-test flow of `run_sweep` (reset overlay -> start Besu ->
+    prelude -> setup -> testing -> stop) but without profiling, and with the
+    testing phase timed via `_replay_file_measure`.
+    """
+    results: dict[str, dict] = {}
+    started_container = False
+    try:
+        with requests.Session() as session:
+            for idx, name in enumerate(tests, start=1):
+                log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
+
+                overlay_reset_all(cfg.besu, log)
+                start_besu(cfg.besu, log)
+                started_container = True
+                wait_for_engine(cfg.besu, secret, log)
+
+                test_ok = True
+
+                # Prelude (gas-bump then funding) — not timed, identical per test.
+                for fname in cfg.input.prelude:
+                    ok, _ = _replay_file_measure(
+                        cfg, secret, session, cfg.input.dir / fname, log,
+                        source_label=f"[{label}] {fname}", phase="prelude",
+                    )
+                    if not ok:
+                        test_ok = False
+                        if cfg.run.fail_fast:
+                            log.event(f"[{label}] fail-fast tripped during prelude {fname}")
+                            break
+
+                testing_metrics: dict | None = None
+                if test_ok or not cfg.run.fail_fast:
+                    # Setup phase (state prep) — replayed, not part of the number.
+                    s_ok, _ = _replay_file_measure(
+                        cfg, secret, session, setup_dir / name, log,
+                        source_label=f"[{label}] setup/{name}", phase="setup",
+                    )
+                    if not s_ok:
+                        test_ok = False
+                    # Testing phase — this is the measured block.
+                    if s_ok or not cfg.run.fail_fast:
+                        t_ok, testing_metrics = _replay_file_measure(
+                            cfg, secret, session, testing_dir / name, log,
+                            source_label=f"[{label}] testing/{name}", phase="testing",
+                        )
+                        if not t_ok:
+                            test_ok = False
+
+                save_container_logs(
+                    cfg.besu.container_name,
+                    log.root / f"besu-{_safe_label(label)}-{idx:04d}-"
+                               f"{_slugify(name)}{'' if test_ok else '-FAIL'}.log",
+                    log,
+                )
+                stop_container(cfg.besu.container_name)
+                started_container = False
+
+                results[name] = {
+                    "ok": test_ok,
+                    "last_newpayload_ms": (
+                        testing_metrics["last_newpayload_ms"] if testing_metrics else None
+                    ),
+                    "total_newpayload_ms": (
+                        testing_metrics["total_newpayload_ms"] if testing_metrics else None
+                    ),
+                    "newpayload_ms": (
+                        testing_metrics["newpayload_ms"] if testing_metrics else []
+                    ),
+                }
+
+                if not test_ok and cfg.run.fail_fast:
+                    log.event(f"[{label}] fail-fast: stopping after {name}")
+                    break
+    finally:
+        if started_container and cfg.run.stop_container_on_exit:
+            log.event(f"[{label}] stopping container {cfg.besu.container_name}")
+            stop_container(cfg.besu.container_name)
+
+    return results
+
+
+def _build_comparison(
+    label_x: str, image_x: str, results_x: dict[str, dict],
+    label_y: str, image_y: str, results_y: dict[str, dict],
+    tests: list[str],
+) -> dict:
+    """Join the two per-version result dicts into a comparison structure.
+
+    Headline metric is `last_newpayload_ms` (the measured testing block).
+    delta_ms = y - x (positive => y slower), delta_pct relative to x.
+    """
+    rows: list[dict] = []
+    x_total = 0.0
+    y_total = 0.0
+    faster = slower = same = 0
+    x_failures = y_failures = 0
+
+    for name in tests:
+        rx = results_x.get(name, {})
+        ry = results_y.get(name, {})
+        x_ms = rx.get("last_newpayload_ms")
+        y_ms = ry.get("last_newpayload_ms")
+        x_ok = bool(rx.get("ok"))
+        y_ok = bool(ry.get("ok"))
+        if not x_ok:
+            x_failures += 1
+        if not y_ok:
+            y_failures += 1
+
+        delta_ms = delta_pct = None
+        if isinstance(x_ms, (int, float)) and isinstance(y_ms, (int, float)):
+            x_total += x_ms
+            y_total += y_ms
+            delta_ms = y_ms - x_ms
+            delta_pct = (delta_ms / x_ms * 100.0) if x_ms else None
+            if delta_pct is None:
+                same += 1
+            elif delta_pct < -1.0:
+                faster += 1
+            elif delta_pct > 1.0:
+                slower += 1
+            else:
+                same += 1
+
+        rows.append({
+            "test": name,
+            "x_ms": x_ms, "y_ms": y_ms,
+            "x_ok": x_ok, "y_ok": y_ok,
+            "delta_ms": delta_ms, "delta_pct": delta_pct,
+        })
+
+    overall_pct = ((y_total - x_total) / x_total * 100.0) if x_total else None
+    return {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "metric": "last_newpayload_ms",
+        "metric_desc": "wall-clock latency of the last engine_newPayload in "
+                       "testing/<name>.txt (the measured heavy block), in ms",
+        "version_x": {"label": label_x, "image": image_x},
+        "version_y": {"label": label_y, "image": image_y},
+        "rows": rows,
+        "summary": {
+            "tests": len(tests),
+            "compared": faster + slower + same,
+            "x_total_ms": x_total,
+            "y_total_ms": y_total,
+            "overall_delta_pct": overall_pct,
+            "y_faster": faster,
+            "y_slower": slower,
+            "neutral": same,
+            "x_failures": x_failures,
+            "y_failures": y_failures,
+        },
+    }
+
+
+def _fmt_ms(v) -> str:
+    if not isinstance(v, (int, float)):
+        return "n/a"
+    return f"{v:,.1f}"
+
+
+def _fmt_pct(v) -> str:
+    if not isinstance(v, (int, float)):
+        return "n/a"
+    return f"{v:+.1f}%"
+
+
+def _render_comparison_html(cmp: dict) -> str:
+    """Self-contained HTML report (embedded CSS + a little vanilla JS for
+    column sorting). No external assets, so it opens fine after `scp`."""
+    import html as _html
+
+    vx, vy = cmp["version_x"], cmp["version_y"]
+    s = cmp["summary"]
+
+    def _cls(delta_pct):
+        if not isinstance(delta_pct, (int, float)):
+            return "na"
+        if delta_pct < -1.0:
+            return "faster"
+        if delta_pct > 1.0:
+            return "slower"
+        return "neutral"
+
+    # Sort rows worst-regression-first so problems are at the top; tests with
+    # no comparable number sink to the bottom.
+    def _sort_key(r):
+        d = r["delta_pct"]
+        return (-d if isinstance(d, (int, float)) else float("inf"),)
+    rows = sorted(cmp["rows"], key=_sort_key)
+
+    body_rows = []
+    for r in rows:
+        cls = _cls(r["delta_pct"])
+        d_ms = r["delta_ms"]
+        body_rows.append(
+            "<tr class='{cls}'>"
+            "<td class='test' title='{full}'><code>{test}</code></td>"
+            "<td class='num'>{x}</td>"
+            "<td class='num'>{y}</td>"
+            "<td class='num delta' data-sort='{dsort}'>{dms}</td>"
+            "<td class='num pct'>{dpct}</td>"
+            "<td class='status'>{stat}</td>"
+            "</tr>".format(
+                cls=cls,
+                full=_html.escape(r["test"]),
+                test=_html.escape(r["test"]),
+                x=_fmt_ms(r["x_ms"]),
+                y=_fmt_ms(r["y_ms"]),
+                dsort=(d_ms if isinstance(d_ms, (int, float)) else 1e18),
+                dms=(f"{d_ms:+,.1f}" if isinstance(d_ms, (int, float)) else "n/a"),
+                dpct=_fmt_pct(r["delta_pct"]),
+                stat=("ok" if (r["x_ok"] and r["y_ok"])
+                      else "fail x" if not r["x_ok"] and r["y_ok"]
+                      else "fail y" if r["x_ok"] and not r["y_ok"]
+                      else "fail x+y"),
+            )
+        )
+
+    overall = s["overall_delta_pct"]
+    overall_cls = _cls(overall)
+    overall_txt = _fmt_pct(overall) if isinstance(overall, (int, float)) else "n/a"
+
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Besu replay comparison: {lx} vs {ly}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 14px/1.5 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         margin: 0; padding: 24px; background: #0f1115; color: #e6e6e6; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  .sub {{ color: #9aa4b2; margin-bottom: 20px; }}
+  .sub code {{ color: #cdd6f4; }}
+  .cards {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; }}
+  .card {{ background: #1b1f2a; border: 1px solid #2a3040; border-radius: 10px;
+          padding: 12px 16px; min-width: 150px; }}
+  .card .k {{ color: #9aa4b2; font-size: 12px; text-transform: uppercase;
+             letter-spacing: .04em; }}
+  .card .v {{ font-size: 22px; font-weight: 600; margin-top: 4px; }}
+  .v.faster {{ color: #51cf66; }} .v.slower {{ color: #ff6b6b; }}
+  .v.neutral {{ color: #e6e6e6; }} .v.na {{ color: #9aa4b2; }}
+  table {{ border-collapse: collapse; width: 100%; background: #161a23;
+          border-radius: 10px; overflow: hidden; }}
+  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #232838; }}
+  th {{ background: #1b2030; cursor: pointer; user-select: none; position: sticky; top: 0; }}
+  th:hover {{ background: #222a3d; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.test code {{ color: #cdd6f4; word-break: break-all; }}
+  tr.faster td.pct, tr.faster td.delta {{ color: #51cf66; }}
+  tr.slower td.pct, tr.slower td.delta {{ color: #ff6b6b; }}
+  tr.neutral td.pct {{ color: #9aa4b2; }}
+  tr.na {{ opacity: .6; }}
+  td.status {{ color: #9aa4b2; }}
+  .legend {{ margin-top: 14px; color: #9aa4b2; font-size: 12px; }}
+</style></head>
+<body>
+  <h1>Besu stateful-replay comparison</h1>
+  <div class="sub">
+    <b>x</b> = <code>{lx}</code> (<code>{ix}</code>) &nbsp;vs&nbsp;
+    <b>y</b> = <code>{ly}</code> (<code>{iy}</code>)<br>
+    Metric: {metric_desc}.<br>
+    Generated {gen}.
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="k">Tests compared</div><div class="v">{compared}/{tests}</div></div>
+    <div class="card"><div class="k">Overall (sum y vs x)</div><div class="v {ocls}">{overall}</div></div>
+    <div class="card"><div class="k">y faster</div><div class="v faster">{faster}</div></div>
+    <div class="card"><div class="k">y slower</div><div class="v slower">{slower}</div></div>
+    <div class="card"><div class="k">neutral (&lt;1%)</div><div class="v neutral">{neutral}</div></div>
+    <div class="card"><div class="k">failures x / y</div><div class="v na">{xf} / {yf}</div></div>
+  </div>
+
+  <table id="cmp">
+    <thead><tr>
+      <th data-col="0" data-type="str">Test</th>
+      <th data-col="1" data-type="num">x · {lx} (ms)</th>
+      <th data-col="2" data-type="num">y · {ly} (ms)</th>
+      <th data-col="3" data-type="num">&#916; ms (y-x)</th>
+      <th data-col="4" data-type="num">&#916; %</th>
+      <th data-col="5" data-type="str">status</th>
+    </tr></thead>
+    <tbody>
+      {rows}
+    </tbody>
+  </table>
+
+  <div class="legend">
+    Rows are sorted worst-regression-first. Green = y faster than x, red = y slower.
+    Click a column header to re-sort. &Delta;% is relative to x.
+  </div>
+
+<script>
+(function () {{
+  var table = document.getElementById('cmp');
+  var tbody = table.tBodies[0];
+  var dir = {{}};
+  function val(td, type) {{
+    if (td && td.dataset && td.dataset.sort !== undefined) return parseFloat(td.dataset.sort);
+    var t = td ? td.textContent.trim() : '';
+    if (type === 'num') {{ var n = parseFloat(t.replace(/[,%+]/g, '')); return isNaN(n) ? Infinity : n; }}
+    return t.toLowerCase();
+  }}
+  Array.prototype.forEach.call(table.tHead.rows[0].cells, function (th) {{
+    th.addEventListener('click', function () {{
+      var col = +th.dataset.col, type = th.dataset.type;
+      dir[col] = !dir[col];
+      var rows = Array.prototype.slice.call(tbody.rows);
+      rows.sort(function (a, b) {{
+        var va = val(a.cells[col], type), vb = val(b.cells[col], type);
+        if (va < vb) return dir[col] ? -1 : 1;
+        if (va > vb) return dir[col] ? 1 : -1;
+        return 0;
+      }});
+      rows.forEach(function (r) {{ tbody.appendChild(r); }});
+    }});
+  }});
+}})();
+</script>
+</body></html>
+""".format(
+        lx=_html.escape(vx["label"]), ly=_html.escape(vy["label"]),
+        ix=_html.escape(vx["image"]), iy=_html.escape(vy["image"]),
+        metric_desc=_html.escape(cmp["metric_desc"]),
+        gen=_html.escape(cmp["generated_at"]),
+        compared=s["compared"], tests=s["tests"],
+        overall=overall_txt, ocls=overall_cls,
+        faster=s["y_faster"], slower=s["y_slower"], neutral=s["neutral"],
+        xf=s["x_failures"], yf=s["y_failures"],
+        rows="\n      ".join(body_rows) if body_rows else
+             "<tr><td colspan='6'>no tests</td></tr>",
+    )
+
+
+def run_compare(
+    cfg: Config,
+    *,
+    image_x: str, image_y: str,
+    label_x: str, label_y: str,
+    filter_override: str | None,
+    limit: int | None,
+    dry_run: bool,
+) -> int:
+    """Compare-mode entry point.
+
+    Runs every selected test on `image_x`, then on `image_y`, then writes
+    comparison.json + comparison.html into the run dir.
+    """
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_root = cfg.run.log_dir / f"{timestamp}-compare"
+    log = SweepLog(log_root)
+    log.event(f"compare start, log dir = {log_root}")
+    log.event(f"  x: label={label_x!r} image={image_x!r}")
+    log.event(f"  y: label={label_y!r} image={image_y!r}")
+
+    tests = discover_tests(cfg, filter_override, limit)
+    log.event(
+        f"matched {len(tests)} tests "
+        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
+    )
+    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
+
+    if dry_run:
+        log.event("dry-run: wrote selected_tests.txt and exiting")
+        log.flush_summary({
+            "mode": "compare", "dry_run": True, "selected": len(tests),
+            "version_x": {"label": label_x, "image": image_x},
+            "version_y": {"label": label_y, "image": image_y},
+        })
+        log.close()
+        print(f"\ncompare dry-run: would run {len(tests)} tests on "
+              f"{label_x!r} then {label_y!r}.")
+        return 0
+
+    # Same preflight as run_sweep (prelude exists, JWT, mounts, sudo).
+    for name in cfg.input.prelude:
+        p = cfg.input.dir / name
+        if not p.is_file():
+            raise FileNotFoundError(f"prelude file missing: {p}")
+    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
+    for spec in cfg.besu.extra_mounts:
+        host = spec.split(":", 1)[0]
+        if not host or not Path(host).exists():
+            raise FileNotFoundError(
+                f"besu.extra_mounts host path does not exist: {host!r} "
+                f"(from spec {spec!r})."
+            )
+    for probe, hint in (
+        (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
+        (["sudo", "-n", str(OVERLAY_SCRIPT), "--help"], f"sudo -n {OVERLAY_SCRIPT} --help"),
+    ):
+        try:
+            _run(probe, capture=True)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            raise RuntimeError(
+                f"`{hint}` failed with exit {e.returncode}: {stderr}\n"
+                "Add a passwordless sudo entry; see README 'AWS VM bootstrap'."
+            ) from None
+
+    secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    setup_dir = cfg.input.dir / cfg.tests.setup_subdir
+    testing_dir = cfg.input.dir / cfg.tests.testing_subdir
+
+    all_results: dict[str, dict[str, dict]] = {}
+    try:
+        for label, image in ((label_x, image_x), (label_y, image_y)):
+            log.event(f"=== running suite on version {label!r} (image={image}) ===")
+            # New Config view with only the image swapped; nothing else mutates,
+            # and the original cfg/besu objects are left untouched.
+            vcfg = dataclasses.replace(
+                cfg, besu=dataclasses.replace(cfg.besu, image=image)
+            )
+            all_results[label] = _run_version(
+                vcfg, label, secret, tests, setup_dir, testing_dir, log
+            )
+    finally:
+        if cfg.run.stop_container_on_exit:
+            stop_container(cfg.besu.container_name)
+
+    comparison = _build_comparison(
+        label_x, image_x, all_results.get(label_x, {}),
+        label_y, image_y, all_results.get(label_y, {}),
+        tests,
+    )
+    json_path = log_root / "comparison.json"
+    html_path = log_root / "comparison.html"
+    json_path.write_text(json.dumps(comparison, indent=2))
+    html_path.write_text(_render_comparison_html(comparison))
+    log.event(f"wrote {json_path}")
+    log.event(f"wrote {html_path}")
+
+    log.flush_summary({
+        "mode": "compare",
+        "version_x": {"label": label_x, "image": image_x},
+        "version_y": {"label": label_y, "image": image_y},
+        "comparison_summary": comparison["summary"],
+    })
+    log.close()
+
+    sm = comparison["summary"]
+    print(f"\nComparison written to:\n  {html_path}\n  {json_path}")
+    print(f"  y faster on {sm['y_faster']} / slower on {sm['y_slower']} / "
+          f"neutral {sm['neutral']} (of {sm['compared']} compared).")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1241,9 +1783,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--profile", action="store_true",
                    help="enable async-profiler around the last newPayload+FCU pair "
                         "of setup/ and testing/ (overrides profile.enabled in yaml)")
-    p.add_argument("--foramez", action="store_true",
-                   help="(personal) at end of run, print scp commands to download "
-                        "the flame graphs to ahamlat's laptop")
+
+    # --- compare mode (run the suite twice on two Besu images, diff the times) ---
+    p.add_argument("--compare", action="store_true",
+                   help="run every selected test on two Besu images back-to-back "
+                        "and emit an HTML comparison of testing-block times")
+    p.add_argument("--image-x", default=None,
+                   help="compare mode: first ('baseline') Besu image. "
+                        "Defaults to besu.image from the config.")
+    p.add_argument("--image-y", default=None,
+                   help="compare mode: second ('candidate') Besu image. Required "
+                        "with --compare.")
+    p.add_argument("--label-x", default=None,
+                   help="compare mode: display label for image-x (default: the image tag)")
+    p.add_argument("--label-y", default=None,
+                   help="compare mode: display label for image-y (default: the image tag)")
     return p.parse_args(argv)
 
 
@@ -1260,9 +1814,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.profile:
         cfg.profile.enabled = True
     _install_sigint_handler()
+
+    if args.compare:
+        image_x = args.image_x or cfg.besu.image
+        image_y = args.image_y
+        if not image_y:
+            print(
+                "error: --compare needs two images. Pass --image-y <image> "
+                "(and optionally --image-x <image>; it defaults to besu.image "
+                f"= {cfg.besu.image!r}).",
+                file=sys.stderr,
+            )
+            return 2
+        label_x = args.label_x or _image_label(image_x)
+        label_y = args.label_y or _image_label(image_y)
+        if label_x == label_y:
+            # Disambiguate identical labels so the report columns stay distinct.
+            label_x, label_y = f"{label_x} (x)", f"{label_y} (y)"
+        return run_compare(
+            cfg,
+            image_x=image_x, image_y=image_y,
+            label_x=label_x, label_y=label_y,
+            filter_override=args.filter, limit=args.limit,
+            dry_run=args.dry_run,
+        )
+
     return run_sweep(cfg, filter_override=args.filter, limit=args.limit,
-                     pick=args.pick, dry_run=args.dry_run,
-                     foramez=args.foramez)
+                     pick=args.pick, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
