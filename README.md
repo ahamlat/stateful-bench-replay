@@ -1,8 +1,9 @@
 # Stateful replay benchmark
 
 Replay engine-API streams (`newPayload` + `forkchoiceUpdated`) against a
-Besu snapshot mounted via OverlayFS, so every test starts from the same
-chain state.
+Besu snapshot, so every test starts from the same chain state. The per-test
+state reset is pluggable (see [Reset backend](#reset-backend-overlayfs-vs-schelk)):
+**OverlayFS** (default) or **schelk** (dm-era block-level rollback).
 
 For each selected test, one Besu container does the full flow end-to-end:
 
@@ -193,6 +194,68 @@ It reads `summary.json` (for the two image labels) and `selected_tests.txt`
 (for the ordered test list), re-parses the `besu-<label>-NNNN-*.log` files,
 and overwrites the two `comparison.*` artefacts in place. No config needed.
 
+## Reset backend: OverlayFS vs schelk
+
+Between every test the harness rolls Besu's on-disk state back to the pristine
+snapshot. Two backends implement that reset; pick one with
+`run.reset_backend` in `config.yaml` or `--reset-backend {overlayfs,schelk}`
+on the CLI (the CLI wins). Besu's bind mount is identical either way
+(`<overlay_dir>/test/merged`), so the same suite runs unchanged on both — handy
+for A/B'ing the reset mechanism itself.
+
+| | `overlayfs` (default) | `schelk` |
+|---|---|---|
+| Layer | OverlayFS over a snapshot **directory** (`scripts/overlay.sh`) | dm-era over a **block device** (`scripts/schelk.sh`) |
+| Hot-path overhead | copy-up on first write + stacked-fs cost | ≈ none (no IO redirection, plain ext4 on NVMe) |
+| Reset speed | instant (wipe `upper`/`work`) | seconds (copy back only written blocks) |
+| Hardware | one dir on one disk | **two equal-size block devices + a DRAM ramdisk** |
+
+Use `schelk` when you need production-faithful block-execution numbers
+(`Mgas/s`, `exec` latency) without OverlayFS copy-up distorting the measured
+block; use `overlayfs` when you can't dedicate two volumes + DRAM or you can
+tolerate the overhead. See [tempoxyz/schelk](https://github.com/tempoxyz/schelk).
+
+### Using the schelk backend
+
+`scripts/schelk.sh` is a drop-in wrapper exposing the same verbs as
+`overlay.sh` (`init` / `mount-all` / `reset-all` / `reset-test` / `umount-all`
+/ `status`), mapped onto schelk's `init-from` / `mount` / `restore` / `recover`
+/ `status`. Per test the sweep calls `reset-all` → `schelk restore`.
+
+One-time VM setup (in addition to the steps in [section 1](#1-one-time-vm-setup)):
+
+```bash
+# 1. Two equal-size block devices; put the Besu snapshot on the VIRGIN one.
+#    SCRATCH is what Besu mounts and writes to.
+
+# 2. Build + install schelk (needs a Rust toolchain).
+git clone https://github.com/tempoxyz/schelk /tmp/schelk
+cargo install --path /tmp/schelk --root /usr/local   # -> /usr/local/bin/schelk
+
+# 3. Adopt the virgin volume and clone it to scratch (heavy, one-time).
+sudo scripts/schelk.sh init \
+    --bin /usr/local/bin/schelk \
+    --virgin /dev/nvme1n1 --scratch /dev/nvme2n1 --ramdisk /dev/ram0 \
+    --mount-point /data/besu-overlay/test/merged --fstype ext4 \
+    --ramdisk-size-kb 4194304
+
+# 4. Allow passwordless sudo for the schelk helper (alongside overlay.sh + docker).
+sudo tee -a /etc/sudoers.d/besu-bench >/dev/null <<EOF
+$USER ALL=(root) NOPASSWD: /home/$USER/stateful-bench-replay/scripts/schelk.sh
+EOF
+```
+
+Then configure the `schelk:` block in `config.yaml` (see
+`config.example.yaml`) and run:
+
+```bash
+./runBenchmark.sh --reset-backend schelk --filter '*sload_bloated*' --limit 1
+```
+
+`--reset-backend schelk` also works with `--compare`. The runner aborts early
+with a clear message if `schelk.virgin` / `schelk.scratch` / `schelk.ramdisk`
+are missing from the config.
+
 ## Troubleshooting
 
 - **`docker logs besu-bench` is empty for minutes after start**: the
@@ -200,6 +263,13 @@ and overwrites the two `comparison.*` artefacts in place. No config needed.
   Set `besu.entrypoint: /opt/besu/bin/besu` to skip the wrapper.
 - **`sudo -n docker version` fails**: re-do the sudoers step above.
 - **`overlay.sh: unknown action: reset-all`**: stale checkout — `git pull`.
+- **`schelk.sh: schelk binary not found`**: `sudo` sanitises `PATH`, so a
+  `cargo install` binary in `~/.cargo/bin` is invisible. Set `schelk.bin` to an
+  absolute path (e.g. install with `--root /usr/local`).
+- **schelk `ramdisk ... not present`**: the dm-era metadata ramdisk is gone
+  (e.g. after a reboot). It is recreated from `schelk.ramdisk_size_kb`; a reboot
+  also invalidates incremental recovery, so run `sudo /usr/local/bin/schelk
+  full-recover` once before the next sweep.
 - **Engine API timeout**: every host path in `besu.extra_mounts` must
   exist on the host; otherwise `docker run` silently creates an empty
   directory there and Besu fails before it logs anything.
