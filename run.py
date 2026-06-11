@@ -82,8 +82,27 @@ class TestsConfig:
 
 
 @dataclasses.dataclass
+class SchelkConfig:
+    """Parameters for the schelk (dm-era) reset backend. Only consulted when
+    run.reset_backend == 'schelk'. The mount point is NOT configured here: it
+    is always <overlay_dir>/test/merged so Besu's existing bind mount keeps
+    working regardless of backend.
+    """
+    bin: str                # path to the schelk binary (absolute recommended;
+                            # sudo sanitises PATH so ~/.cargo/bin is invisible)
+    virgin: str             # pristine baseline block device (holds the snapshot)
+    scratch: str            # working block device Besu mounts and writes to
+    ramdisk: str            # block device for dm-era metadata (e.g. /dev/ram0)
+    fstype: str             # filesystem on the volumes (ext4, xfs, ...)
+    granularity: int | None # dm-era block granularity in bytes (default 4096)
+    ramdisk_size_kb: int | None  # size to modprobe brd with if ramdisk absent
+    no_copy: bool           # init-from --no-copy (volumes already identical)
+
+
+@dataclasses.dataclass
 class RunConfig:
     reset_overlay: bool
+    reset_backend: str
     log_dir: Path
     request_timeout_s: int
     fail_fast: bool
@@ -114,6 +133,7 @@ class Config:
     tests: TestsConfig
     run: RunConfig
     profile: ProfileConfig
+    schelk: SchelkConfig
 
 
 def _abs_path(p: str | os.PathLike) -> Path:
@@ -155,12 +175,40 @@ def load_config(path: Path) -> Config:
         ),
         run=RunConfig(
             reset_overlay=bool(r.get("reset_overlay", True)),
+            reset_backend=_validate_backend(r.get("reset_backend", "overlayfs")),
             log_dir=_abs_path(r.get("log_dir", "./runs")),
             request_timeout_s=int(r.get("request_timeout_s", 120)),
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
         ),
         profile=_load_profile(raw.get("profile")),
+        schelk=_load_schelk(raw.get("schelk")),
+    )
+
+
+RESET_BACKENDS = ("overlayfs", "schelk")
+
+
+def _validate_backend(value: str) -> str:
+    value = str(value).lower()
+    if value not in RESET_BACKENDS:
+        raise ValueError(
+            f"run.reset_backend must be one of {RESET_BACKENDS}, got {value!r}"
+        )
+    return value
+
+
+def _load_schelk(raw: dict | None) -> SchelkConfig:
+    raw = raw or {}
+    return SchelkConfig(
+        bin=str(raw.get("bin", "schelk")),
+        virgin=str(raw.get("virgin", "")),
+        scratch=str(raw.get("scratch", "")),
+        ramdisk=str(raw.get("ramdisk", "")),
+        fstype=str(raw.get("fstype", "ext4")),
+        granularity=(int(raw["granularity"]) if raw.get("granularity") else None),
+        ramdisk_size_kb=(int(raw["ramdisk_size_kb"]) if raw.get("ramdisk_size_kb") else None),
+        no_copy=bool(raw.get("no_copy", False)),
     )
 
 
@@ -561,10 +609,16 @@ def start_besu(
 
 
 # ---------------------------------------------------------------------------
-# Overlay helpers
+# Reset backend helpers (OverlayFS or schelk/dm-era)
 # ---------------------------------------------------------------------------
 
 OVERLAY_SCRIPT = Path(__file__).resolve().parent / "scripts" / "overlay.sh"
+SCHELK_SCRIPT = Path(__file__).resolve().parent / "scripts" / "schelk.sh"
+
+
+def reset_script(cfg: Config) -> Path:
+    """The sudo entrypoint script for the configured reset backend."""
+    return SCHELK_SCRIPT if cfg.run.reset_backend == "schelk" else OVERLAY_SCRIPT
 
 
 def _overlay(action: str, cfg: BesuConfig, log: SweepLog, *extra_args: str) -> None:
@@ -604,6 +658,55 @@ def overlay_mount_all(cfg: BesuConfig, log: SweepLog) -> None:
 
 def overlay_reset_test(cfg: BesuConfig, log: SweepLog) -> None:
     _overlay("reset-test", cfg, log)
+
+
+def _schelk_flags(cfg: Config) -> list[str]:
+    """Common schelk.sh flags. The mount point is fixed at <overlay_dir>/test/
+    merged (set at init time) so it is not repeated here; mount/restore/recover
+    read it from schelk's saved state."""
+    s = cfg.schelk
+    flags = ["--bin", s.bin]
+    if s.virgin:
+        flags += ["--virgin", s.virgin]
+    if s.scratch:
+        flags += ["--scratch", s.scratch]
+    if s.ramdisk:
+        flags += ["--ramdisk", s.ramdisk]
+    if s.fstype:
+        flags += ["--fstype", s.fstype]
+    if s.granularity:
+        flags += ["--granularity", str(s.granularity)]
+    if s.ramdisk_size_kb:
+        flags += ["--ramdisk-size-kb", str(s.ramdisk_size_kb)]
+    return flags
+
+
+def _schelk(action: str, cfg: Config, log: SweepLog) -> None:
+    cmd = ["sudo", "-n", str(SCHELK_SCRIPT), action] + _schelk_flags(cfg)
+    log.event(f"schelk {action}: " + " ".join(shlex.quote(a) for a in cmd))
+    _run(cmd)
+
+
+# --- Backend-neutral dispatch --------------------------------------------------
+# run.py only needs two operations during a sweep: "reset to the pristine
+# baseline (and mount it)" before each test, and (rarely) "just mount". Both
+# call sites go through these dispatchers so the chosen backend is the only
+# thing that changes between an OverlayFS run and a schelk run.
+
+def reset_to_baseline(cfg: Config, log: SweepLog) -> None:
+    """Roll on-disk state back to the pristine snapshot and (re)mount it."""
+    if cfg.run.reset_backend == "schelk":
+        _schelk("reset-all", cfg, log)
+    else:
+        overlay_reset_all(cfg.besu, log)
+
+
+def mount_baseline(cfg: Config, log: SweepLog) -> None:
+    """Mount the current baseline without resetting it."""
+    if cfg.run.reset_backend == "schelk":
+        _schelk("mount-all", cfg, log)
+    else:
+        overlay_mount_all(cfg.besu, log)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,11 +1147,12 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
             )
 
     # Preflight: passwordless sudo for both helpers we depend on.
+    _reset_script = reset_script(cfg)
     for probe, hint in (
         (DOCKER + ["version", "--format", "{{.Server.Version}}"],
          "sudo -n docker version"),
-        (["sudo", "-n", str(OVERLAY_SCRIPT), "--help"],
-         f"sudo -n {OVERLAY_SCRIPT} --help"),
+        (["sudo", "-n", str(_reset_script), "--help"],
+         f"sudo -n {_reset_script} --help"),
     ):
         try:
             _run(probe, capture=True)
@@ -1076,9 +1180,11 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
             for idx, name in enumerate(tests, start=1):
                 log.event(f"[{idx}/{len(tests)}] {name}")
 
-                # Wipe both overlay layers (prelude + test) and remount.
-                # Everything below writes into the test layer.
-                overlay_reset_all(cfg.besu, log)
+                # Roll on-disk state back to the pristine baseline and remount.
+                # With the OverlayFS backend this wipes both overlay layers;
+                # with the schelk backend it does an incremental dm-era restore.
+                # Everything below writes into the freshly-reset state.
+                reset_to_baseline(cfg, log)
 
                 start_besu(
                     cfg.besu, log,
@@ -1192,7 +1298,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 # per-test testing-block times and emit an HTML report.
 #
 # This whole section is additive: it reuses the existing helpers (start_besu,
-# overlay_reset_all, wait_for_engine, post_engine_line, _classify, _scan_lines,
+# reset_to_baseline, wait_for_engine, post_engine_line, _classify, _scan_lines,
 # discover_tests, SweepLog, ...) without modifying any of them, so the default
 # single-image sweep keeps behaving exactly as before.
 # ===========================================================================
@@ -1383,7 +1489,7 @@ def _run_version(
             for idx, name in enumerate(tests, start=1):
                 log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
 
-                overlay_reset_all(cfg.besu, log)
+                reset_to_baseline(cfg, log)
                 start_besu(cfg.besu, log)
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
@@ -1873,9 +1979,10 @@ def run_compare(
                 f"besu.extra_mounts host path does not exist: {host!r} "
                 f"(from spec {spec!r})."
             )
+    _reset_script = reset_script(cfg)
     for probe, hint in (
         (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
-        (["sudo", "-n", str(OVERLAY_SCRIPT), "--help"], f"sudo -n {OVERLAY_SCRIPT} --help"),
+        (["sudo", "-n", str(_reset_script), "--help"], f"sudo -n {_reset_script} --help"),
     ):
         try:
             _run(probe, capture=True)
@@ -2024,6 +2131,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--profile", action="store_true",
                    help="enable async-profiler around the last newPayload+FCU pair "
                         "of setup/ and testing/ (overrides profile.enabled in yaml)")
+    p.add_argument("--reset-backend", choices=RESET_BACKENDS, default=None,
+                   help="how to reset Besu state between tests: 'overlayfs' "
+                        "(OverlayFS over a snapshot dir, default) or 'schelk' "
+                        "(dm-era block-level rollback). Overrides run.reset_backend.")
 
     # --- compare mode (run the suite twice on two Besu images, diff the times) ---
     p.add_argument("--compare", action="store_true",
@@ -2063,6 +2174,21 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(_abs_path(args.config))
     if args.profile:
         cfg.profile.enabled = True
+    if args.reset_backend:
+        cfg.run.reset_backend = args.reset_backend
+    if cfg.run.reset_backend == "schelk":
+        missing = [k for k in ("virgin", "scratch", "ramdisk")
+                   if not getattr(cfg.schelk, k)]
+        if missing:
+            print(
+                "error: reset_backend='schelk' requires schelk.{} in the config "
+                "(block devices for the dm-era backend). See config.example.yaml.".format(
+                    ", schelk.".join(missing)
+                ),
+                file=sys.stderr,
+            )
+            return 2
+    print(f"reset backend: {cfg.run.reset_backend}")
     _install_sigint_handler()
 
     if args.compare:

@@ -124,6 +124,22 @@ run:
   # writes (rare; only useful for incremental experiments).
   reset_overlay: true
 
+  # How to reset Besu's on-disk state between tests:
+  #   overlayfs (default) - OverlayFS over the read-only snapshot DIRECTORY
+  #                         (scripts/overlay.sh). No extra disks; reset is an
+  #                         instant directory wipe, but first-write copy-up and
+  #                         the stacked filesystem add overhead in the hot path.
+  #   schelk              - tempoxyz/schelk: dm-era block-level rollback
+  #                         (scripts/schelk.sh). The benchmark runs against a
+  #                         plain ext4 on a real NVMe (no overlay, no copy-up),
+  #                         so block-execution numbers are not distorted; reset
+  #                         copies back only the blocks the test wrote. Requires
+  #                         two equal-size block devices + a ramdisk (see the
+  #                         `schelk:` section below) and a one-time
+  #                         `sudo scripts/schelk.sh init ...`.
+  # Override on the CLI with --reset-backend {overlayfs,schelk}.
+  reset_backend: overlayfs
+
   # Per-sweep timestamped subdirectory is created under this path.
   log_dir: ./runs
 
@@ -182,3 +198,52 @@ profile:
   # by a signal (which happens many times per second on a busy JVM).
   # Bump to INFO/DEBUG when investigating profiler internals.
   log_level: warn
+
+# schelk (dm-era) reset backend. Only used when run.reset_backend == 'schelk'
+# (or --reset-backend schelk). Ignored entirely for the default OverlayFS path.
+#
+# schelk operates on raw BLOCK DEVICES, not directories: a pristine "virgin"
+# device holds the baseline Besu snapshot and the "scratch" device is what Besu
+# mounts and writes to. dm-era records which 4 KiB blocks the test wrote;
+# reset copies only those blocks back from virgin -> scratch.
+#
+# One-time setup (per VM), then the sweep just calls `schelk restore` per test:
+#   1. Put the Besu snapshot on the virgin device (e.g. restore it onto
+#      /dev/nvme1n1 and the scratch device /dev/nvme2n1 must be equal size).
+#   2. cargo install --path .   # from a clone of github.com/tempoxyz/schelk
+#   3. sudo scripts/schelk.sh init \
+#          --bin /usr/local/bin/schelk \
+#          --virgin /dev/nvme1n1 --scratch /dev/nvme2n1 --ramdisk /dev/ram0 \
+#          --mount-point /data/besu-overlay/test/merged --fstype ext4 \
+#          --ramdisk-size-kb 4194304
+#   4. Add scripts/schelk.sh to the sudoers NOPASSWD allowlist (same as
+#      overlay.sh).
+# The mount point is ALWAYS <besu.overlay_dir>/test/merged so Besu's existing
+# bind mount keeps working; you do not configure it here.
+schelk:
+  # Path to the schelk binary. Use an ABSOLUTE path: sudo sanitises PATH so a
+  # `cargo install` binary in ~/.cargo/bin is not visible to the helper.
+  bin: /usr/local/bin/schelk
+
+  # Pristine baseline block device (holds the snapshot; never written by Besu).
+  virgin: /dev/nvme1n1
+
+  # Working block device Besu mounts and writes to. Must equal virgin in size.
+  scratch: /dev/nvme2n1
+
+  # Block device for dm-era metadata. Created from DRAM via `modprobe brd`.
+  ramdisk: /dev/ram0
+
+  # Filesystem on the volumes.
+  fstype: ext4
+
+  # dm-era tracking granularity in bytes (optional; schelk defaults to 4096).
+  # granularity: 4096
+
+  # If /dev/ram0 is absent, schelk.sh loads brd with this size (KB). Rule of
+  # thumb: ~4 GiB per ~1.7 TiB drive at 4 KiB granularity. 4 GiB = 4194304 KB.
+  ramdisk_size_kb: 4194304
+
+  # Skip the virgin->scratch copy at `init` time (you assert they are already
+  # identical). Dangerous if untrue; leave false unless you know what you do.
+  no_copy: false
