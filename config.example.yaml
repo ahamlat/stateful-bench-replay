@@ -184,7 +184,23 @@ profile:
 
   # Output format -> file extension. html/flamegraph -> .html, jfr -> .jfr.
   # html is self-contained and viewable in a browser; jfr needs JMC/IntelliJ.
+  # NOTE: only jfr can hold MULTIPLE event types at once (see alloc/lock below).
   output_format: html
+
+  # Allocation (memory) and lock-contention profiling, recorded ALONGSIDE the
+  # primary `event` above. These map to async-profiler's --alloc / --lock and
+  # only work with output_format: jfr (the runner auto-switches to jfr and
+  # warns if you set either with html). Leave unset for a single-event profile.
+  #   alloc: sample about once per this many allocated bytes (e.g. 512k, 2m)
+  #   lock:  record lock/monitor waits held longer than this (e.g. 10ms, 1ms)
+  # Combined CPU + memory + lock profile in one JFR per phase:
+  #   event: cpu            # or wall (no perf_events needed)
+  #   output_format: jfr
+  #   alloc: 512k
+  #   lock: 10ms
+  # Or just pass --jfr-all on the CLI to get all three without editing config.
+  # alloc: 512k
+  # lock: 10ms
 
   # Extra flags passed verbatim to `asprof start`. Defaults include `-t` so
   # the flame graph is split per thread (vert.x workers vs. main vs. GC),
