@@ -124,6 +124,8 @@ class ProfileConfig:
     output_format: str             # html | jfr | flamegraph (-> .html)
     extra_args: list[str]          # extra flags passed to asprof start
     log_level: str                 # asprof --log level (TRACE..NONE), default warn
+    alloc: str | None              # --alloc <bytes> (allocation/memory profiling); needs jfr
+    lock: str | None               # --lock <duration> (lock contention profiling); needs jfr
 
 
 @dataclasses.dataclass
@@ -214,6 +216,20 @@ def _load_schelk(raw: dict | None) -> SchelkConfig:
 
 def _load_profile(raw: dict | None) -> ProfileConfig:
     raw = raw or {}
+    alloc = (str(raw["alloc"]) if raw.get("alloc") else None)
+    lock = (str(raw["lock"]) if raw.get("lock") else None)
+    output_format = str(raw.get("output_format", "html"))
+    # Recording more than one event at once (the primary -e event plus alloc
+    # and/or lock) only works with JFR output. Auto-upgrade and warn instead of
+    # failing at asprof start with "Only JFR output supports multiple events".
+    if (alloc or lock) and output_format != "jfr":
+        print(
+            "warn: profile.alloc/lock enable multi-event profiling, which "
+            "requires JFR; forcing profile.output_format=jfr "
+            f"(was {output_format!r})",
+            file=sys.stderr,
+        )
+        output_format = "jfr"
     # Default to wall-clock profiling with per-thread split: works without
     # kernel.perf_event_paranoid tuning, and `-t` makes it easy to see which
     # vert.x worker thread did the heavy lifting vs. main / GC threads.
@@ -223,13 +239,15 @@ def _load_profile(raw: dict | None) -> ProfileConfig:
         container_dir=str(raw.get("container_dir", "/opt/async-profiler")),
         event=str(raw.get("event", "wall")),
         interval=str(raw.get("interval", "1ms")),
-        output_format=str(raw.get("output_format", "html")),
+        output_format=output_format,
         extra_args=list(raw.get("extra_args") or ["-t"]),
         # async-profiler 4.x logs `io_uring_wait_cqe failed: -4` (EINTR)
         # on every signal-interrupted poll of its sample queue. The retries
         # are silent at WARN level. Set NONE to silence everything, INFO
         # for the original chatty default.
         log_level=str(raw.get("log_level", "warn")),
+        alloc=alloc,
+        lock=lock,
     )
 
 
@@ -411,6 +429,18 @@ class ProfilerSession:
         cmd = DOCKER + ["exec", self.container] + list(args)
         return _run(cmd, capture=True, check=False)
 
+    def _event_args(self) -> list[str]:
+        """Extra async-profiler event selectors from the convenience config
+        keys. `--alloc`/`--lock` turn on allocation (memory) and lock
+        contention profiling alongside the primary `-e` event; recording more
+        than one event at once requires JFR output (see start())."""
+        out: list[str] = []
+        if self.cfg.alloc:
+            out += ["--alloc", self.cfg.alloc]
+        if self.cfg.lock:
+            out += ["--lock", self.cfg.lock]
+        return out
+
     def start(self) -> None:
         # Note on PID: the entrypoint we use (/opt/besu/bin/besu) is a shell
         # script that exec's java, so PID 1 is the JVM by the time we get
@@ -420,9 +450,18 @@ class ProfilerSession:
             "--log", self.cfg.log_level,
             "-e", self.cfg.event,
             "-i", self.cfg.interval,
+            *self._event_args(),
             *self.cfg.extra_args,
-            "1",
         ]
+        # async-profiler picks the output format from the -f extension. JFR is
+        # the only format that can hold MULTIPLE concurrent events (cpu/wall +
+        # alloc + lock), and it rejects >1 event unless it already knows at
+        # START time that the recording is JFR. So for jfr we pass the target
+        # file here; flat formats (html) are rendered from the in-memory buffer
+        # at stop, so they keep passing -f there instead.
+        if self.cfg.output_format == "jfr":
+            args += ["-f", self._container_output_path]
+        args.append("1")
         res = self._exec(*args)
         if res.returncode != 0:
             err = (res.stderr or res.stdout or "").strip()
@@ -442,12 +481,12 @@ class ProfilerSession:
     def stop(self) -> None:
         if not self.started:
             return
-        args = [
-            self._asprof, "stop",
-            "--log", self.cfg.log_level,
-            "-f", self._container_output_path,
-            "1",
-        ]
+        args = [self._asprof, "stop", "--log", self.cfg.log_level]
+        # For JFR the file was opened at start and is finalised by stop, so we
+        # must NOT pass -f again. Flat formats are dumped here.
+        if self.cfg.output_format != "jfr":
+            args += ["-f", self._container_output_path]
+        args.append("1")
         res = self._exec(*args)
         if res.returncode != 0:
             err = (res.stderr or res.stdout or "").strip()
@@ -2131,6 +2170,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--profile", action="store_true",
                    help="enable async-profiler around the last newPayload+FCU pair "
                         "of setup/ and testing/ (overrides profile.enabled in yaml)")
+    p.add_argument("--jfr-all", action="store_true",
+                   help="enable profiling and capture CPU/wall + allocation (memory) "
+                        "+ lock contention into a single JFR per phase (sets "
+                        "output_format=jfr and default --alloc/--lock if unset)")
     p.add_argument("--reset-backend", choices=RESET_BACKENDS, default=None,
                    help="how to reset Besu state between tests: 'overlayfs' "
                         "(OverlayFS over a snapshot dir, default) or 'schelk' "
@@ -2174,6 +2217,13 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(_abs_path(args.config))
     if args.profile:
         cfg.profile.enabled = True
+    if args.jfr_all:
+        cfg.profile.enabled = True
+        cfg.profile.output_format = "jfr"
+        if not cfg.profile.alloc:
+            cfg.profile.alloc = "512k"
+        if not cfg.profile.lock:
+            cfg.profile.lock = "10ms"
     if args.reset_backend:
         cfg.run.reset_backend = args.reset_backend
     if cfg.run.reset_backend == "schelk":
