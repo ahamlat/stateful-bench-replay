@@ -1338,6 +1338,140 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     return 0 if sweep_ok else 1
 
 
+# ---------------------------------------------------------------------------
+# Prepare a pre-bumped snapshot (OverlayFS): bake the gas-bump blocks into a
+# new snapshot directory so later sweeps can use --skip-gas-bump and avoid
+# replaying the 5000-block gas-bump before every test.
+# ---------------------------------------------------------------------------
+
+def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
+    """Build a new snapshot directory that already contains the gas-bump blocks.
+
+    OverlayFS only. Flow: reset+mount the overlay, start Besu, replay ONLY the
+    gas-bump file (input.gas_bump_file), stop Besu so RocksDB is flushed, then
+    rsync the flattened <overlay_dir>/test/merged view into `baseline_out`. The
+    original snapshot dir is never modified, so you switch baselines just by
+    pointing besu.data_snapshot_dir at the new directory and running with
+    --skip-gas-bump (funding stays in the prelude and chains onto the bump tip).
+    """
+    if cfg.run.reset_backend != "overlayfs":
+        print("error: --prepare-baseline currently supports only the overlayfs "
+              "backend. For schelk, bake the gas-bump into the virgin block "
+              "device and re-run `schelk init` instead.", file=sys.stderr)
+        return 2
+
+    gas_bump = cfg.input.gas_bump_file
+    src = cfg.input.dir / gas_bump
+    if not src.is_file():
+        print(f"error: gas-bump file not found: {src} "
+              "(set input.gas_bump_file to the right name).", file=sys.stderr)
+        return 2
+
+    out = (baseline_out or Path(str(cfg.besu.data_snapshot_dir) + "-bumped")).expanduser()
+    # Never clobber the source baseline or the live overlay scratch root.
+    for forbidden, why in (
+        (cfg.besu.data_snapshot_dir, "the existing snapshot dir"),
+        (cfg.besu.overlay_dir, "the overlay scratch root"),
+    ):
+        if str(out) == str(forbidden) or _same_path(out, forbidden):
+            print(f"error: --baseline-out {out} would overwrite {why}; "
+                  "choose a different path.", file=sys.stderr)
+            return 2
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = SweepLog(cfg.run.log_dir / f"{timestamp}-prepare")
+    log.event(f"prepare-baseline start: replay {gas_bump} -> new snapshot {out}")
+
+    # Focused preflight (mirrors run_sweep, minus the per-test machinery).
+    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
+    for spec in cfg.besu.extra_mounts:
+        host = spec.split(":", 1)[0]
+        if not host or not Path(host).exists():
+            raise FileNotFoundError(
+                f"besu.extra_mounts host path does not exist: {host!r} "
+                f"(from spec {spec!r})."
+            )
+    _reset_script = reset_script(cfg)
+    for probe, hint in (
+        (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
+        (["sudo", "-n", str(_reset_script), "--help"], f"sudo -n {_reset_script} --help"),
+    ):
+        try:
+            _run(probe, capture=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"`{hint}` failed with exit {e.returncode}: {(e.stderr or '').strip()}"
+            ) from None
+
+    secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    merged = cfg.besu.overlay_dir / "test" / "merged"
+    started = False
+    ok = False
+    try:
+        with requests.Session() as session:
+            reset_to_baseline(cfg, log)
+            start_besu(cfg.besu, log)
+            started = True
+            wait_for_engine(cfg.besu, secret, log)
+            log_chain_head(cfg.besu, log, "head BEFORE gas-bump")
+            ok = replay_file(cfg, secret, session, src, log, phase="prepare")
+            if ok:
+                log_chain_head(cfg.besu, log, "head AFTER gas-bump")
+            save_container_logs(
+                cfg.besu.container_name,
+                log.root / f"besu-prepare{'' if ok else '-FAIL'}.log", log,
+            )
+            # Stop Besu so RocksDB flushes and releases its files before we copy
+            # the on-disk state (same consistency point the sweep relies on).
+            stop_container(cfg.besu.container_name)
+            started = False
+            if not ok:
+                log.event("prepare-baseline: gas-bump replay failed; snapshot NOT written")
+            else:
+                out.mkdir(parents=True, exist_ok=True)
+                # Trailing slash copies the CONTENTS of merged to the root of
+                # out, so out/database, out/caches, ... mirror the snapshot
+                # layout. sudo: the datadir is root-owned. --delete keeps a
+                # re-run idempotent.
+                rsync = ["sudo", "rsync", "-aHAX", "--numeric-ids", "--delete",
+                         f"{merged}/", f"{out}/"]
+                log.event("prepare-baseline: "
+                          + " ".join(shlex.quote(a) for a in rsync))
+                _run(rsync)
+                log.event(f"prepare-baseline: wrote pre-bumped snapshot to {out}")
+        log.event(f"prepare-baseline end: ok={ok}")
+    finally:
+        if started and cfg.run.stop_container_on_exit:
+            log.event(f"stopping container {cfg.besu.container_name}")
+            stop_container(cfg.besu.container_name)
+        log.flush_summary({
+            "prepare_baseline": True,
+            "ok": ok,
+            "gas_bump_file": gas_bump,
+            "snapshot_out": str(out),
+        })
+        log.close()
+
+    if not ok:
+        print("prepare-baseline failed: see the events log and besu-prepare-FAIL.log "
+              f"in {log.root}", file=sys.stderr)
+        return 1
+    print()
+    print(f"Pre-bumped snapshot ready: {out}")
+    print("Use it for future sweeps by setting, in config.yaml:")
+    print(f"  besu:\n    data_snapshot_dir: {out}")
+    print("  run:\n    skip_gas_bump: true      # or pass --skip-gas-bump on the CLI")
+    return 0
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """True if two paths resolve to the same location (existing or not)."""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return os.path.normpath(str(a)) == os.path.normpath(str(b))
+
+
 # ===========================================================================
 # Compare mode: run the whole suite twice on two Besu images, then diff the
 # per-test testing-block times and emit an HTML report.
@@ -2189,6 +2323,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="skip the gas-bump prelude file (input.gas_bump_file); use "
                         "when the snapshot ALREADY contains the gas-bumped blocks. "
                         "Overrides run.skip_gas_bump.")
+    p.add_argument("--prepare-baseline", action="store_true",
+                   help="(overlayfs) bake the gas-bump blocks into a new snapshot "
+                        "directory so later sweeps can run with --skip-gas-bump. "
+                        "Resets+mounts the overlay, starts Besu, replays ONLY "
+                        "input.gas_bump_file, stops Besu, then rsyncs the flattened "
+                        "result into --baseline-out. Runs no tests; the original "
+                        "snapshot dir is left untouched.")
+    p.add_argument("--baseline-out", default=None, metavar="DIR",
+                   help="output directory for --prepare-baseline "
+                        "(default: <besu.data_snapshot_dir>-bumped).")
 
     # --- compare mode (run the suite twice on two Besu images, diff the times) ---
     p.add_argument("--compare", action="store_true",
@@ -2273,6 +2417,12 @@ def main(argv: list[str] | None = None) -> int:
                   f"({cfg.input.prelude or '[]'})")
 
     _install_sigint_handler()
+
+    if args.prepare_baseline:
+        return run_prepare_baseline(
+            cfg,
+            Path(args.baseline_out).expanduser() if args.baseline_out else None,
+        )
 
     if args.compare:
         image_x = args.image_x or cfg.besu.image
