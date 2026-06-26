@@ -96,6 +96,13 @@ input:
     - gas-bump.txt
     - funding.txt
 
+  # Which prelude entry is the gas-bump. When run.skip_gas_bump (or
+  # --skip-gas-bump) is set, this file is dropped from the prelude above, so
+  # only the remaining entries (e.g. funding.txt) are replayed. Use that mode
+  # when your snapshot ALREADY contains the gas-bumped blocks (i.e. the
+  # snapshot/virgin tip IS the gas-bump tip).
+  gas_bump_file: gas-bump.txt
+
 tests:
   setup_subdir: setup
   testing_subdir: testing
@@ -152,6 +159,13 @@ run:
   # Stop and remove the Besu container when the sweep finishes (or on error).
   # Set false to leave it running for inspection.
   stop_container_on_exit: true
+
+  # Skip the gas-bump prelude file (input.gas_bump_file) instead of replaying
+  # it before every test. Use ONLY when the snapshot already contains the
+  # gas-bumped blocks, so the chain is snapshot tip (= gas-bump tip) -> funding
+  # -> tests. If the snapshot does NOT have those blocks, funding/tests will
+  # fail with SYNCING (missing parent). Override on the CLI with --skip-gas-bump.
+  skip_gas_bump: false
 
 # Async-profiler integration (optional). When enabled (here OR via --profile
 # on the CLI), the runner brackets the LAST newPayload + FCU pair of each

@@ -71,6 +71,8 @@ class BesuConfig:
 class InputConfig:
     dir: Path
     prelude: list[str]
+    gas_bump_file: str   # prelude entry treated as the gas-bump (skipped when
+                         # run.skip_gas_bump / --skip-gas-bump is set)
 
 
 @dataclasses.dataclass
@@ -107,6 +109,8 @@ class RunConfig:
     request_timeout_s: int
     fail_fast: bool
     stop_container_on_exit: bool
+    skip_gas_bump: bool   # drop input.gas_bump_file from the prelude (snapshot
+                          # already contains the gas-bumped blocks)
 
 
 @dataclasses.dataclass
@@ -168,6 +172,7 @@ def load_config(path: Path) -> Config:
         input=InputConfig(
             dir=_abs_path(i["dir"]),
             prelude=list(i.get("prelude") or []),
+            gas_bump_file=str(i.get("gas_bump_file", "gas-bump.txt")),
         ),
         tests=TestsConfig(
             setup_subdir=t.get("setup_subdir", "setup"),
@@ -182,6 +187,7 @@ def load_config(path: Path) -> Config:
             request_timeout_s=int(r.get("request_timeout_s", 120)),
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
+            skip_gas_bump=bool(r.get("skip_gas_bump", False)),
         ),
         profile=_load_profile(raw.get("profile")),
         schelk=_load_schelk(raw.get("schelk")),
@@ -2178,6 +2184,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="how to reset Besu state between tests: 'overlayfs' "
                         "(OverlayFS over a snapshot dir, default) or 'schelk' "
                         "(dm-era block-level rollback). Overrides run.reset_backend.")
+    p.add_argument("--skip-gas-bump", "--no-gas-bump", dest="skip_gas_bump",
+                   action="store_true", default=None,
+                   help="skip the gas-bump prelude file (input.gas_bump_file); use "
+                        "when the snapshot ALREADY contains the gas-bumped blocks. "
+                        "Overrides run.skip_gas_bump.")
 
     # --- compare mode (run the suite twice on two Besu images, diff the times) ---
     p.add_argument("--compare", action="store_true",
@@ -2239,6 +2250,28 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
     print(f"reset backend: {cfg.run.reset_backend}")
+
+    # Gas-bump skip: when the snapshot already contains the gas-bumped blocks,
+    # drop input.gas_bump_file from the prelude so it is not replayed. funding
+    # (and the tests) then chain straight onto the snapshot tip, which must be
+    # the gas-bump tip. Done once here so every downstream site (preflight,
+    # sweep, compare) sees the already-filtered prelude.
+    if args.skip_gas_bump:
+        cfg.run.skip_gas_bump = True
+    if cfg.run.skip_gas_bump:
+        before = list(cfg.input.prelude)
+        cfg.input.prelude = [f for f in before
+                             if Path(f).name != cfg.input.gas_bump_file]
+        removed = [f for f in before if f not in cfg.input.prelude]
+        if removed:
+            print(f"skip-gas-bump: omitting prelude file(s) {removed}; snapshot "
+                  f"must already contain the gas-bumped blocks. prelude is now "
+                  f"{cfg.input.prelude or '[]'}")
+        else:
+            print(f"skip-gas-bump: no prelude entry named "
+                  f"{cfg.input.gas_bump_file!r} to skip; prelude unchanged "
+                  f"({cfg.input.prelude or '[]'})")
+
     _install_sigint_handler()
 
     if args.compare:
