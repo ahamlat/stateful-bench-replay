@@ -88,10 +88,16 @@ ensure_ramdisk() {
     [[ -b "$RAMDISK" ]] || die "ramdisk $RAMDISK still not present after modprobe brd"
 }
 
-schelk() {
+# NB: this function is deliberately NOT named `schelk`. The default SCHELK_BIN
+# is the bare string "schelk", and a function of the same name would shadow the
+# external binary, so `"$SCHELK_BIN" "$@"` would recurse into this function
+# forever (stack overflow / segfault) instead of running the real program. We
+# also invoke through the `command` builtin, which skips shell functions and
+# resolves "schelk" via PATH, as a second line of defence.
+run_schelk() {
     command -v "$SCHELK_BIN" >/dev/null 2>&1 || [[ -x "$SCHELK_BIN" ]] \
         || die "schelk binary not found: $SCHELK_BIN (set schelk.bin to an absolute path; sudo sanitises PATH so ~/.cargo/bin is not visible)"
-    "$SCHELK_BIN" "$@"
+    command "$SCHELK_BIN" "$@"
 }
 
 cmd_init() {
@@ -111,13 +117,13 @@ cmd_init() {
     [[ -n "$MOUNT_OPTIONS" ]]  && args+=(--mount-options "$MOUNT_OPTIONS")
     [[ "$NO_COPY" -eq 1 ]]     && args+=(--no-copy)
     echo "schelk.sh: ${SCHELK_BIN} ${args[*]}"
-    schelk "${args[@]}"
+    run_schelk "${args[@]}"
 }
 
 cmd_mount_all() {
     ensure_ramdisk
     echo "schelk.sh: ${SCHELK_BIN} mount"
-    schelk mount
+    run_schelk mount
 }
 
 # reset-all / reset-test: roll scratch back to the virgin baseline, then mount.
@@ -127,16 +133,16 @@ cmd_mount_all() {
 cmd_reset() {
     ensure_ramdisk
     echo "schelk.sh: ${SCHELK_BIN} restore -k"
-    schelk restore -k
+    run_schelk restore -k
 }
 
 cmd_umount_all() {
     echo "schelk.sh: ${SCHELK_BIN} recover -k"
-    schelk recover -k
+    run_schelk recover -k
 }
 
 cmd_status() {
-    schelk status
+    run_schelk status
 }
 
 usage() { sed -n '2,46p' "$0"; }

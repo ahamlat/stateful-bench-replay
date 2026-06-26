@@ -222,33 +222,109 @@ tolerate the overhead. See [tempoxyz/schelk](https://github.com/tempoxyz/schelk)
 / `status`), mapped onto schelk's `init-from` / `mount` / `restore` / `recover`
 / `status`. Per test the sweep calls `reset-all` → `schelk restore`.
 
-One-time VM setup (in addition to the steps in [section 1](#1-one-time-vm-setup)):
+The one-time setup has four phases: **prepare the disks**, **build the
+tooling**, **`schelk init`**, then **configure + run**. Do them in order.
+
+#### A. Prepare the disks (the part most people get wrong)
+
+schelk needs **two equal-size raw block devices** plus a small DRAM ramdisk:
+
+- **virgin** — holds the pristine Besu snapshot; Besu *never* writes it.
+- **scratch** — equal size; Besu mounts and writes this. `init` clones virgin
+  onto it, and each reset copies back only the blocks the test changed.
+- **ramdisk** (`/dev/ram0`) — dm-era metadata. `schelk.sh` creates it with
+  `modprobe brd` from `schelk.ramdisk_size_kb` if it is absent. Rule of thumb:
+  ~4 GiB per ~1.7 TiB of volume at 4 KiB granularity.
+
+The two devices can be **two whole disks** (best: virgin and scratch on
+separate physical disks → no IO contention during the measured block) or **two
+partitions on one disk** (fine for getting started; they share a spindle). Each
+must be **larger than the snapshot** (`du -sh <snapshot>` to check).
+
+Example: split one empty disk into two equal partitions, then load the snapshot
+onto virgin. The snapshot's **contents must sit at the root** of the virgin
+filesystem (i.e. `database/`, `caches/`, … directly under the mount), because
+that filesystem *is* what Besu sees as its data dir.
 
 ```bash
-# 1. Two equal-size block devices; put the Besu snapshot on the VIRGIN one.
-#    SCRATCH is what Besu mounts and writes to.
+# 1. Two equal partitions (THIS ERASES THE DISK). Or use two separate disks.
+sudo wipefs -a /dev/nvmeXn1
+sudo parted -s /dev/nvmeXn1 mklabel gpt
+sudo parted -s /dev/nvmeXn1 mkpart virgin  ext4 0%   50%
+sudo parted -s /dev/nvmeXn1 mkpart scratch ext4 50%  100%
+sudo partprobe /dev/nvmeXn1            # -> nvmeXn1p1 (virgin), nvmeXn1p2 (scratch)
 
-# 2. Build + install schelk (needs a Rust toolchain).
+# 2. Filesystem on VIRGIN, then load the snapshot at the FS root.
+sudo mkfs.ext4 -F -L besu-virgin /dev/nvmeXn1p1
+sudo mkdir -p /mnt/virgin && sudo mount /dev/nvmeXn1p1 /mnt/virgin
+#    ... rsync / download / restore the Besu data dir INTO /mnt/virgin so that
+#        /mnt/virgin/database, /mnt/virgin/caches, ... exist (NOT /mnt/virgin/besu/...).
+sudo ls -la /mnt/virgin               # sanity: datadir layout at the root
+sync && sudo umount /mnt/virgin       # MUST be cleanly unmounted before init
+
+# 3. Leave SCRATCH (nvmeXn1p2) raw and unmounted; init clones virgin onto it.
+```
+
+> NB: on AWS instance-store NVMe (e.g. i3en), all of this lives on **ephemeral**
+> storage. A stop/terminate wipes it (redo mkfs + reload snapshot + `init`); a
+> reboot keeps the data but invalidates incremental recovery — see Troubleshooting.
+
+#### B. Build the tooling
+
+```bash
+# schelk itself (needs Rust >= 1.85; edition-2024). Build as your user, then
+# copy into place — sudo sanitises PATH so ~/.cargo/bin is invisible to the helper.
 git clone https://github.com/tempoxyz/schelk /tmp/schelk
-cargo install --path /tmp/schelk --root /usr/local   # -> /usr/local/bin/schelk
+cargo install --path /tmp/schelk --root "$HOME/.local"
+sudo install -m 0755 "$HOME/.local/bin/schelk" /usr/local/bin/schelk
 
-# 3. Adopt the virgin volume and clone it to scratch (heavy, one-time).
+# thin-provisioning-tools >= 1.0 for a FAST per-test reset. The distro's 0.9.0
+# `era_invalidate` makes every reset take minutes; 1.0+ (Rust) makes it seconds.
+sudo apt-get install -y clang libudev-dev libdevmapper-dev pkg-config build-essential
+git clone https://github.com/device-mapper-utils/thin-provisioning-tools /tmp/tpt
+cd /tmp/tpt && cargo build --release          # -> target/release/pdata_tools
+sudo install -m 0755 target/release/pdata_tools /usr/local/sbin/pdata_tools
+for t in era_invalidate era_check era_dump era_restore; do
+    sudo ln -sf /usr/local/sbin/pdata_tools /usr/local/sbin/$t   # /usr/local/sbin wins under sudo
+done
+```
+
+#### C. `schelk init` (heavy, one-time: full virgin → scratch clone)
+
+```bash
+cd ~/stateful-bench-replay
 sudo scripts/schelk.sh init \
     --bin /usr/local/bin/schelk \
-    --virgin /dev/nvme1n1 --scratch /dev/nvme2n1 --ramdisk /dev/ram0 \
+    --virgin /dev/nvmeXn1p1 --scratch /dev/nvmeXn1p2 --ramdisk /dev/ram0 \
     --mount-point /data/besu-overlay/test/merged --fstype ext4 \
-    --ramdisk-size-kb 4194304
+    --ramdisk-size-kb 8388608
 
-# 4. Allow passwordless sudo for the schelk helper (alongside overlay.sh + docker).
+# Allow passwordless sudo for the schelk helper (alongside overlay.sh + docker).
 sudo tee -a /etc/sudoers.d/besu-bench >/dev/null <<EOF
 $USER ALL=(root) NOPASSWD: /home/$USER/stateful-bench-replay/scripts/schelk.sh
 EOF
 ```
 
-Then configure the `schelk:` block in `config.yaml` (see
-`config.example.yaml`) and run:
+#### D. Configure + run
+
+Set the `schelk:` block in `config.yaml` (see `config.example.yaml`) to the same
+devices, and — since a schelk box has no overlay snapshot dir — make schelk the
+default so you do not have to pass the flag every time:
+
+```yaml
+run:
+  reset_backend: schelk
+schelk:
+  bin: /usr/local/bin/schelk
+  virgin:  /dev/nvmeXn1p1
+  scratch: /dev/nvmeXn1p2
+  ramdisk: /dev/ram0
+  fstype: ext4
+  ramdisk_size_kb: 8388608
+```
 
 ```bash
+./runBenchmark.sh --reset-backend schelk --dry-run                       # expect "reset backend: schelk"
 ./runBenchmark.sh --reset-backend schelk --filter '*sload_bloated*' --limit 1
 ```
 
@@ -270,6 +346,19 @@ are missing from the config.
   (e.g. after a reboot). It is recreated from `schelk.ramdisk_size_kb`; a reboot
   also invalidates incremental recovery, so run `sudo /usr/local/bin/schelk
   full-recover` once before the next sweep.
+- **schelk reset is slow (`era_invalidate version 0.9.0 is slow`)**: the distro
+  `thin-provisioning-tools` is the bottleneck — the per-test `restore` runs
+  `era_invalidate` every time. Build `>= 1.0` (Rust) and install it ahead of the
+  packaged copy (see [phase B](#b-build-the-tooling)); resets drop from minutes
+  to seconds.
+- **`schelk.sh status` segfaults / `bash: segfault ... in libc.so.6`**: an old
+  `schelk.sh` shadowed the `schelk` binary with a same-named shell function and
+  recursed (only when called by hand *without* `--bin`; the sweep always passes
+  it). Fixed in the current script — refresh your checkout, or pass
+  `--bin /usr/local/bin/schelk` on manual calls.
+- **`overlay.sh: snapshot dir not found: /data/besu`** on a schelk box: the run
+  fell back to the OverlayFS backend, whose snapshot directory no longer exists.
+  Pass `--reset-backend schelk` or set `run.reset_backend: schelk` in the config.
 - **Engine API timeout**: every host path in `besu.extra_mounts` must
   exist on the host; otherwise `docker run` silently creates an empty
   directory there and Besu fails before it logs anything.
