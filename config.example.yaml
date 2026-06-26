@@ -175,6 +175,17 @@ run:
   # fail with SYNCING (missing parent). Override on the CLI with --skip-gas-bump.
   skip_gas_bump: false
 
+  # persist_prelude (OverlayFS only): zero-copy alternative to
+  # skip_gas_bump + a pre-bumped snapshot. At sweep start the runner bakes
+  # input.gas_bump_file ONCE into a persistent prelude overlay layer (Besu
+  # mounted on prelude/merged), then for every test wipes ONLY the test layer
+  # (reset-test) and keeps the baked gas-bump. The gas-bump is dropped from the
+  # per-test prelude, so each test replays only the rest (e.g. funding) on top
+  # of the persisted gas-bump tip -- no 5000-block replay and no snapshot copy.
+  # Mutually exclusive with skip_gas_bump. Override on the CLI with
+  # --persist-prelude.
+  persist_prelude: false
+
 # Async-profiler integration (optional). When enabled (here OR via --profile
 # on the CLI), the runner brackets the LAST newPayload + FCU pair of each
 # phase with `asprof start` / `asprof stop`. This gives one flame graph per
