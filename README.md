@@ -75,6 +75,35 @@ $EDITOR config.yaml          # set besu.image, input.dir, paths to JWT + genesis
 
 First call bootstraps `./venv/` from `requirements.txt` automatically.
 
+### Skip the gas-bump prelude (pre-bumped snapshots)
+
+The prelude normally builds the chain bottom-up: `snapshot tip → gas-bump
+(5000 blocks) → funding (1 block) → tests`, replayed before **every** test. If
+your snapshot was captured **after** the gas-bump blocks were already applied
+(its tip *is* the gas-bump tip), replaying `gas-bump.txt` is redundant. Skip it:
+
+```bash
+# CLI (overrides the config for this run)
+./runBenchmark.sh --skip-gas-bump --filter '*sload_bloated*' --limit 1
+```
+
+```yaml
+# or make it the default in config.yaml
+run:
+  skip_gas_bump: true
+```
+
+When set, the runner drops `input.gas_bump_file` (default `gas-bump.txt`) from
+the prelude, so only the remaining entries (e.g. `funding.txt`) are replayed —
+`funding` then chains straight onto the snapshot tip. It works with every mode
+(`--compare`, `--profile`, both reset backends) and prints what it removed at
+startup (`skip-gas-bump: omitting prelude file(s) ['gas-bump.txt'] …`).
+
+> Use this **only** when the snapshot really contains the gas-bumped blocks. If
+> it doesn't, `funding`/the tests fail with `SYNCING` (missing parent), because
+> their `parentHash` points at the gas-bump tip. If your gas-bump file has a
+> different name, set `input.gas_bump_file` to match.
+
 ## 4. Inspect results
 
 Every run creates `runs/<timestamp>/`:
