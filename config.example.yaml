@@ -13,6 +13,14 @@ besu:
   # snapshot itself is never written to.
   data_snapshot_dir: /data/besu
 
+  # Pre-bumped snapshot (OverlayFS): a copy of the snapshot that already
+  # contains the gas-bump blocks, produced once by `--prepare-baseline`. When
+  # gas-bump is skipped (run.skip_gas_bump / --skip-gas-bump) the runner uses
+  # THIS directory as the baseline instead of data_snapshot_dir, so a single
+  # flag switches both the prelude and the snapshot with no config edit.
+  # Defaults to "<data_snapshot_dir>-bumped" (e.g. /data/besu-bumped) if unset.
+  # bumped_snapshot_dir: /data/besu-bumped
+
   # Two-layer overlay scratch root. The runner / overlay.sh creates:
   #   <overlay_dir>/prelude/{upper,work,merged}   - writes from gas-bump+funding
   #   <overlay_dir>/test/{upper,work,merged}      - writes from current test
