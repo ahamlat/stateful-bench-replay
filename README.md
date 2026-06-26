@@ -147,6 +147,50 @@ you switch between the pristine and pre-bumped baselines. Artefacts (events log,
 mode is OverlayFS-only; for schelk you bake the gas-bump into the virgin block
 device and re-run `schelk init`.
 
+### Zero-copy gas-bump skip (`--persist-prelude`, OverlayFS)
+
+`--persist-prelude` gets the same "no per-test gas-bump" win **without
+building or copying a separate snapshot**. It leans on the two-layer overlay
+layout (`prelude` over the read-only snapshot, `test` over `prelude`):
+
+1. **Once per sweep** the runner mounts *only* the prelude layer
+   (`overlay.sh bake-prelude`), starts Besu on `prelude/merged`, replays
+   `input.gas_bump_file`, and stops Besu. The gas-bump's writes are now baked
+   into the **persistent** `prelude/upper`.
+2. **For every test** it wipes *only* the test layer (`reset-test`) and keeps
+   the prelude. Each test replays just the remaining prelude (e.g.
+   `funding.txt`) plus setup/testing on top of the persisted gas-bump tip.
+
+```bash
+# bakes gas-bump into the prelude layer once, then runs the suite
+./runBenchmark.sh --persist-prelude --filter '*sload_bloated*' --limit 1
+
+# works with --compare too (the prelude is re-baked once per image)
+./runBenchmark.sh --compare --persist-prelude \
+  --image-x ethpandaops/besu:A --image-y ethpandaops/besu:B \
+  --filter '*test_account_access*'
+```
+
+How it compares to `--skip-gas-bump`:
+
+| | `--skip-gas-bump` | `--persist-prelude` |
+|---|---|---|
+| Setup | needs `--prepare-baseline` first | none |
+| Disk | a second snapshot dir (hardlinked) | none (writes live in the overlay) |
+| Where the bump lives | a pre-bumped snapshot dir | the persistent `prelude` overlay layer |
+| Per-test reset | `reset-all` (both layers) | `reset-test` (test layer only) |
+
+Both drop `input.gas_bump_file` from the per-test prelude, so they are
+**mutually exclusive** (the runner errors if you pass both). The runner prints
+what it did at startup (`persist-prelude: omitting prelude file(s)
+['gas-bump.txt'] …`, then `persist-prelude: baking gas-bump.txt into the
+prelude layer` and the prelude chain head before/after). The bake log lands in
+`runs/<timestamp>/besu-prelude-bake.log`. This mode is OverlayFS-only.
+
+> The installed `overlay.sh` must understand the `bake-prelude` verb. If you
+> see *"overlay.sh rejected this action"*, refresh the system copy:
+> `sudo install -m 0755 scripts/overlay.sh /usr/local/sbin/besu-overlay.sh`.
+
 ## 4. Inspect results
 
 Every run creates `runs/<timestamp>/`:

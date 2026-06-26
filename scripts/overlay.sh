@@ -16,9 +16,10 @@
 #   overlay.sh init       <snapshot_dir> <overlay_root>
 #   overlay.sh mount-all  <snapshot_dir> <overlay_root>
 #   overlay.sh umount-all <overlay_root>
-#   overlay.sh reset-all  <snapshot_dir> <overlay_root>
-#   overlay.sh reset-test <snapshot_dir> <overlay_root>
-#   overlay.sh status     <overlay_root>
+#   overlay.sh reset-all    <snapshot_dir> <overlay_root>
+#   overlay.sh reset-test   <snapshot_dir> <overlay_root>
+#   overlay.sh bake-prelude <snapshot_dir> <overlay_root>   (mount prelude only)
+#   overlay.sh status       <overlay_root>
 #
 # Backwards-compat aliases (single-layer naming from earlier version):
 #   overlay.sh mount   <snapshot_dir> <overlay_root>   = mount-all
@@ -149,6 +150,21 @@ cmd_reset_test() {
     mount_test "$root"
 }
 
+cmd_bake_prelude() {
+    # Wipe both layers and mount ONLY the prelude layer (test NOT mounted), so
+    # Besu started on prelude/merged writes into the persistent prelude upper.
+    # Used by run.py's persist-prelude mode to bake the gas-bump once.
+    local snapshot="$1" root="$2"
+    require_abs "$snapshot"; require_abs "$root"
+    cmd_init "$snapshot" "$root"
+    umount_test "$root"
+    umount_prelude "$root"
+    wipe_test "$root"
+    wipe_prelude "$root"
+    mount_prelude "$snapshot" "$root"
+    echo "overlay.sh: prelude ready at $root/prelude/merged (test layer NOT mounted; bake writes go to prelude/upper)"
+}
+
 cmd_status() {
     local root="$1"
     require_abs "$root"
@@ -175,8 +191,10 @@ main() {
         reset-all|reset)
                      [[ $# -eq 2 ]] || die "usage: $0 reset-all <snapshot> <root>";   cmd_reset_all  "$1" "$2" ;;
         reset-test)  [[ $# -eq 2 ]] || die "usage: $0 reset-test <snapshot> <root>";  cmd_reset_test "$1" "$2" ;;
+        bake-prelude)
+                     [[ $# -eq 2 ]] || die "usage: $0 bake-prelude <snapshot> <root>"; cmd_bake_prelude "$1" "$2" ;;
         status)      [[ $# -eq 1 ]] || die "usage: $0 status <root>";                 cmd_status     "$1" ;;
-        ""|-h|--help|help) sed -n '2,28p' "$0" ;;
+        ""|-h|--help|help) sed -n '2,31p' "$0" ;;
         *) die "unknown action: $action (try --help)" ;;
     esac
 }

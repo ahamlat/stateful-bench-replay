@@ -113,6 +113,10 @@ class RunConfig:
     stop_container_on_exit: bool
     skip_gas_bump: bool   # drop input.gas_bump_file from the prelude (snapshot
                           # already contains the gas-bumped blocks)
+    persist_prelude: bool # OverlayFS only: bake input.gas_bump_file ONCE into a
+                          # persistent prelude overlay layer at sweep start, then
+                          # keep it across per-test resets (reset-test). The
+                          # gas-bump is dropped from the per-test prelude.
 
 
 @dataclasses.dataclass
@@ -192,6 +196,7 @@ def load_config(path: Path) -> Config:
             fail_fast=bool(r.get("fail_fast", False)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
             skip_gas_bump=bool(r.get("skip_gas_bump", False)),
+            persist_prelude=bool(r.get("persist_prelude", False)),
         ),
         profile=_load_profile(raw.get("profile")),
         schelk=_load_schelk(raw.get("schelk")),
@@ -601,20 +606,25 @@ def start_besu(
     *,
     profile: ProfileConfig | None = None,
     profile_output_dir: Path | None = None,
+    data_mount: Path | None = None,
 ) -> None:
-    """Boot Besu with its data-path bound to the test overlay layer.
+    """Boot Besu with its data-path bound to an overlay layer.
 
     Each benchmark run does the entire flow (gas-bump + funding + setup +
     testing) in this single container, so there is no need to stage writes
-    across multiple overlay layers anymore. We always mount
-    <overlay_dir>/test/merged; the prelude overlay layer remains in the
-    on-disk layout for backwards compatibility but no longer holds state.
+    across multiple overlay layers anymore. We normally mount
+    <overlay_dir>/test/merged.
+
+    `data_mount` overrides which directory is bound to the container's
+    data-path. The persist-prelude bake phase passes
+    <overlay_dir>/prelude/merged so the gas-bump's writes land in the
+    persistent prelude layer instead of the per-test layer.
 
     If `profile` is enabled, also bind-mount async-profiler read-only and
     a writable output dir for flame graphs.
     """
     stop_container(cfg.container_name)
-    merged = cfg.overlay_dir / "test" / "merged"
+    merged = data_mount if data_mount is not None else (cfg.overlay_dir / "test" / "merged")
     # NOTE: no --rm here. We want the container to stick around if Besu
     # crashes, so wait_for_engine can dump `docker logs` on failure.
     # stop_container() above and at end-of-test cleans it up.
@@ -672,7 +682,7 @@ def reset_script(cfg: Config) -> Path:
 
 def _overlay(action: str, cfg: BesuConfig, log: SweepLog, *extra_args: str) -> None:
     cmd = ["sudo", "-n", str(OVERLAY_SCRIPT), action]
-    if action in ("init", "mount-all", "reset-all", "reset-test"):
+    if action in ("init", "mount-all", "reset-all", "reset-test", "bake-prelude"):
         cmd += [str(cfg.data_snapshot_dir), str(cfg.overlay_dir)]
     else:
         cmd += [str(cfg.overlay_dir)]
@@ -684,7 +694,7 @@ def _overlay(action: str, cfg: BesuConfig, log: SweepLog, *extra_args: str) -> N
         # The two-layer actions (mount-all, reset-all, reset-test) were added
         # together; if any of them is rejected with "unknown action", the
         # installed overlay.sh is from before that change.
-        if action in ("mount-all", "reset-all", "reset-test"):
+        if action in ("mount-all", "reset-all", "reset-test", "bake-prelude"):
             print(
                 "\nbench: overlay.sh rejected this action. The installed copy is "
                 "probably an older single-layer version.\n"
@@ -707,6 +717,16 @@ def overlay_mount_all(cfg: BesuConfig, log: SweepLog) -> None:
 
 def overlay_reset_test(cfg: BesuConfig, log: SweepLog) -> None:
     _overlay("reset-test", cfg, log)
+
+
+def overlay_bake_prelude(cfg: BesuConfig, log: SweepLog) -> None:
+    """Wipe both overlay layers and mount ONLY the prelude layer.
+
+    Leaves <overlay_dir>/prelude/merged mounted with the test layer
+    intentionally unmounted, so Besu started on it writes into the
+    persistent prelude upper dir. Used by the persist-prelude bake phase.
+    """
+    _overlay("bake-prelude", cfg, log)
 
 
 def _schelk_flags(cfg: Config) -> list[str]:
@@ -756,6 +776,20 @@ def mount_baseline(cfg: Config, log: SweepLog) -> None:
         _schelk("mount-all", cfg, log)
     else:
         overlay_mount_all(cfg.besu, log)
+
+
+def per_test_reset(cfg: Config, log: SweepLog) -> None:
+    """Reset on-disk state before a single test.
+
+    With persist-prelude (OverlayFS only) the gas-bump lives in a persistent
+    prelude layer baked once at sweep start, so we only wipe the test layer
+    (reset-test) and keep the prelude. Otherwise fall back to the full
+    baseline reset.
+    """
+    if cfg.run.persist_prelude and cfg.run.reset_backend == "overlayfs":
+        overlay_reset_test(cfg.besu, log)
+    else:
+        reset_to_baseline(cfg, log)
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1174,56 @@ def _interactive_pick(tests: list[str], log: SweepLog) -> list[str]:
         print(f"  out of range, must be 1..{len(tests)}")
 
 
+def bake_prelude_layer(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    log: SweepLog,
+    label: str = "",
+) -> bool:
+    """Bake input.gas_bump_file ONCE into the persistent prelude overlay layer.
+
+    OverlayFS only. Mounts ONLY the prelude layer (test layer NOT mounted, so
+    Besu's writes land in prelude/upper), starts Besu on prelude/merged,
+    replays the gas-bump, then stops Besu (flushing RocksDB) while LEAVING the
+    prelude mounted so per-test `reset-test` can stack the test layer on top.
+
+    Returns True on success. The 5000-block gas-bump then survives every
+    per-test reset instead of being replayed before each test.
+    """
+    pfx = f"[{label}] " if label else ""
+    gas_bump = cfg.input.gas_bump_file
+    src = cfg.input.dir / gas_bump
+    prelude_merged = cfg.besu.overlay_dir / "prelude" / "merged"
+
+    if not src.is_file():
+        log.event(f"{pfx}persist-prelude: gas-bump file not found: {src}")
+        return False
+
+    log.event(f"{pfx}persist-prelude: baking {gas_bump} into the prelude layer")
+    overlay_bake_prelude(cfg.besu, log)
+
+    ok = False
+    try:
+        start_besu(cfg.besu, log, data_mount=prelude_merged)
+        wait_for_engine(cfg.besu, secret, log)
+        log_chain_head(cfg.besu, log, f"{pfx}prelude head BEFORE gas-bump")
+        ok = replay_file(cfg, secret, session, src, log, phase="prelude-bake")
+        if ok:
+            log_chain_head(cfg.besu, log, f"{pfx}prelude head AFTER gas-bump")
+        bake_log = (
+            log.root
+            / f"besu-prelude-bake{('-' + _safe_label(label)) if label else ''}"
+              f"{'' if ok else '-FAIL'}.log"
+        )
+        save_container_logs(cfg.besu.container_name, bake_log, log)
+    finally:
+        # Stop Besu so prelude/upper is flushed and consistent. The overlay
+        # mount is host-side and survives the container teardown.
+        stop_container(cfg.besu.container_name)
+    return ok
+
+
 def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
               pick: bool, dry_run: bool) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1221,6 +1305,14 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 
     try:
         with requests.Session() as session:
+            # persist-prelude: bake the gas-bump ONCE into the persistent
+            # prelude overlay layer, then keep it across per-test resets.
+            if cfg.run.persist_prelude:
+                if not bake_prelude_layer(cfg, secret, session, log):
+                    log.event("persist-prelude: gas-bump bake FAILED; aborting before tests")
+                    sweep_ok = False
+                    tests = []
+
             # Each test runs end-to-end in ONE Besu container:
             #   reset overlay -> start Besu -> gas-bump -> funding ->
             #   setup -> testing -> stop Besu
@@ -1232,8 +1324,10 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                 # Roll on-disk state back to the pristine baseline and remount.
                 # With the OverlayFS backend this wipes both overlay layers;
                 # with the schelk backend it does an incremental dm-era restore.
+                # With persist-prelude we instead wipe ONLY the test layer and
+                # keep the baked gas-bump prelude.
                 # Everything below writes into the freshly-reset state.
-                reset_to_baseline(cfg, log)
+                per_test_reset(cfg, log)
 
                 start_besu(
                     cfg.besu, log,
@@ -1437,7 +1531,17 @@ def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
                 # out, so out/database, out/caches, ... mirror the snapshot
                 # layout. sudo: the datadir is root-owned. --delete keeps a
                 # re-run idempotent.
+                #
+                # --link-dest=<original snapshot>: the pre-bumped baseline is
+                # read-only (only ever an overlay lowerdir), so files the
+                # gas-bump did NOT change are hardlinked from the original
+                # snapshot instead of copied. That turns a full ~snapshot-size
+                # copy into hardlinks + only the changed RocksDB files (seconds
+                # + a few GB instead of the whole DB). Cross-filesystem dests
+                # just fall back to a normal copy, which is still correct.
                 rsync = ["sudo", "rsync", "-aHAX", "--numeric-ids", "--delete",
+                         "--info=progress2",
+                         f"--link-dest={cfg.besu.data_snapshot_dir}",
                          f"{merged}/", f"{out}/"]
                 log.event("prepare-baseline: "
                           + " ".join(shlex.quote(a) for a in rsync))
@@ -1679,10 +1783,17 @@ def _run_version(
     started_container = False
     try:
         with requests.Session() as session:
+            # persist-prelude: bake the gas-bump once (per version) into the
+            # persistent prelude layer; per-test resets then keep it.
+            if cfg.run.persist_prelude:
+                if not bake_prelude_layer(cfg, secret, session, log, label=label):
+                    log.event(f"[{label}] persist-prelude: gas-bump bake FAILED; "
+                              "skipping this version's tests")
+                    return results
             for idx, name in enumerate(tests, start=1):
                 log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
 
-                reset_to_baseline(cfg, log)
+                per_test_reset(cfg, log)
                 start_besu(cfg.besu, log)
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
@@ -2337,6 +2448,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="skip the gas-bump prelude file (input.gas_bump_file); use "
                         "when the snapshot ALREADY contains the gas-bumped blocks. "
                         "Overrides run.skip_gas_bump.")
+    p.add_argument("--persist-prelude", dest="persist_prelude",
+                   action="store_true", default=None,
+                   help="(overlayfs) bake input.gas_bump_file ONCE into a persistent "
+                        "prelude overlay layer at sweep start, then keep it across "
+                        "per-test resets (reset-test). Zero-copy alternative to "
+                        "--prepare-baseline + --skip-gas-bump; the gas-bump is "
+                        "dropped from the per-test prelude. Overrides "
+                        "run.persist_prelude.")
     p.add_argument("--prepare-baseline", action="store_true",
                    help="(overlayfs) bake the gas-bump blocks into a new snapshot "
                         "directory so later sweeps can run with --skip-gas-bump. "
@@ -2416,18 +2535,47 @@ def main(argv: list[str] | None = None) -> int:
     # sweep, compare) sees the already-filtered prelude.
     if args.skip_gas_bump:
         cfg.run.skip_gas_bump = True
-    if cfg.run.skip_gas_bump:
+    if args.persist_prelude:
+        cfg.run.persist_prelude = True
+
+    if cfg.run.skip_gas_bump and cfg.run.persist_prelude:
+        print(
+            "error: --skip-gas-bump and --persist-prelude are mutually exclusive. "
+            "Both remove the gas-bump from the per-test prelude, but --skip-gas-bump "
+            "expects a pre-bumped snapshot while --persist-prelude bakes the gas-bump "
+            "into a persistent overlay layer at sweep start. Pick one.",
+            file=sys.stderr,
+        )
+        return 2
+    if cfg.run.persist_prelude and cfg.run.reset_backend != "overlayfs":
+        print(
+            "error: --persist-prelude is OverlayFS-only (it bakes the gas-bump into "
+            "the prelude overlay layer). For the schelk backend, bake the gas-bump "
+            "into the virgin device instead.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Either gas-bump-skipping mode drops input.gas_bump_file from the PER-TEST
+    # prelude. --skip-gas-bump expects it already in the snapshot; --persist-prelude
+    # bakes it once into the prelude overlay layer (below / in the sweep). Done
+    # once here so every downstream site (preflight, sweep, compare) sees the
+    # already-filtered prelude.
+    if cfg.run.skip_gas_bump or cfg.run.persist_prelude:
+        mode = "skip-gas-bump" if cfg.run.skip_gas_bump else "persist-prelude"
         before = list(cfg.input.prelude)
         cfg.input.prelude = [f for f in before
                              if Path(f).name != cfg.input.gas_bump_file]
         removed = [f for f in before if f not in cfg.input.prelude]
         if removed:
-            print(f"skip-gas-bump: omitting prelude file(s) {removed}; snapshot "
-                  f"must already contain the gas-bumped blocks. prelude is now "
+            where = ("the pre-bumped snapshot" if cfg.run.skip_gas_bump
+                     else "the persistent prelude layer")
+            print(f"{mode}: omitting prelude file(s) {removed} from the per-test "
+                  f"prelude (replayed once into {where}). per-test prelude is now "
                   f"{cfg.input.prelude or '[]'}")
         else:
-            print(f"skip-gas-bump: no prelude entry named "
-                  f"{cfg.input.gas_bump_file!r} to skip; prelude unchanged "
+            print(f"{mode}: no prelude entry named "
+                  f"{cfg.input.gas_bump_file!r} to skip; per-test prelude unchanged "
                   f"({cfg.input.prelude or '[]'})")
 
     _install_sigint_handler()
