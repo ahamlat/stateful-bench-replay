@@ -104,6 +104,37 @@ startup (`skip-gas-bump: omitting prelude file(s) ['gas-bump.txt'] …`).
 > their `parentHash` points at the gas-bump tip. If your gas-bump file has a
 > different name, set `input.gas_bump_file` to match.
 
+#### Building the pre-bumped snapshot (`--prepare-baseline`, OverlayFS)
+
+To *produce* a snapshot that already contains the gas-bump blocks, run the
+one-time prepare step. It resets+mounts the overlay, starts Besu, replays
+**only** `input.gas_bump_file`, stops Besu, then `rsync`s the flattened
+`<overlay_dir>/test/merged` view into a **new** snapshot directory (the
+original `data_snapshot_dir` is left untouched). It runs no tests.
+
+```bash
+# Writes /data/besu-bumped by default (<data_snapshot_dir>-bumped)
+./runBenchmark.sh --prepare-baseline
+
+# or choose where it lands
+./runBenchmark.sh --prepare-baseline --baseline-out /data/besu-gasbumped
+```
+
+Then point the snapshot at the result and skip the gas-bump from now on:
+
+```yaml
+besu:
+  data_snapshot_dir: /data/besu-bumped   # the pre-bumped snapshot
+run:
+  skip_gas_bump: true                    # funding still replays per test
+```
+
+Because the original snapshot is preserved, flipping `data_snapshot_dir` (and
+`skip_gas_bump`) is how you choose between the pristine and pre-bumped
+baselines. Artefacts (events log, `besu-prepare.log`, `summary.json`) land in
+`runs/<timestamp>-prepare/`. This mode is OverlayFS-only; for schelk you bake
+the gas-bump into the virgin block device and re-run `schelk init`.
+
 ## 4. Inspect results
 
 Every run creates `runs/<timestamp>/`:
