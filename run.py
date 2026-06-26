@@ -57,6 +57,8 @@ class BesuConfig:
     image: str
     container_name: str
     data_snapshot_dir: Path
+    bumped_snapshot_dir: Path | None  # pre-bumped snapshot used when gas-bump is
+                                      # skipped (default <data_snapshot_dir>-bumped)
     overlay_dir: Path
     jwt_secret_path: Path
     engine_url: str
@@ -160,6 +162,8 @@ def load_config(path: Path) -> Config:
             image=b["image"],
             container_name=b.get("container_name", "besu-bench"),
             data_snapshot_dir=_abs_path(b["data_snapshot_dir"]),
+            bumped_snapshot_dir=(_abs_path(b["bumped_snapshot_dir"])
+                                 if b.get("bumped_snapshot_dir") else None),
             overlay_dir=_abs_path(b["overlay_dir"]),
             jwt_secret_path=_abs_path(b["jwt_secret_path"]),
             engine_url=b["engine_url"].rstrip("/"),
@@ -1367,7 +1371,7 @@ def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
               "(set input.gas_bump_file to the right name).", file=sys.stderr)
         return 2
 
-    out = (baseline_out or Path(str(cfg.besu.data_snapshot_dir) + "-bumped")).expanduser()
+    out = (baseline_out or _bumped_snapshot_dir(cfg)).expanduser()
     # Never clobber the source baseline or the live overlay scratch root.
     for forbidden, why in (
         (cfg.besu.data_snapshot_dir, "the existing snapshot dir"),
@@ -1470,6 +1474,16 @@ def _same_path(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except OSError:
         return os.path.normpath(str(a)) == os.path.normpath(str(b))
+
+
+def _bumped_snapshot_dir(cfg: Config) -> Path:
+    """Where the pre-bumped snapshot lives: besu.bumped_snapshot_dir if set,
+    else <data_snapshot_dir>-bumped. Both --prepare-baseline (output) and
+    --skip-gas-bump (input) resolve it the same way, so one flag switches
+    baselines with no config edit."""
+    if cfg.besu.bumped_snapshot_dir is not None:
+        return cfg.besu.bumped_snapshot_dir
+    return Path(str(cfg.besu.data_snapshot_dir) + "-bumped")
 
 
 # ===========================================================================
@@ -2423,6 +2437,23 @@ def main(argv: list[str] | None = None) -> int:
             cfg,
             Path(args.baseline_out).expanduser() if args.baseline_out else None,
         )
+
+    # When gas-bump is skipped on OverlayFS, also switch the baseline to the
+    # pre-bumped snapshot automatically, so one flag (--skip-gas-bump) flips
+    # both the prelude AND the snapshot with no config edit. (schelk's baseline
+    # is the virgin block device, so there is no dir to swap.)
+    if cfg.run.skip_gas_bump and cfg.run.reset_backend == "overlayfs":
+        bumped = _bumped_snapshot_dir(cfg)
+        if not bumped.is_dir():
+            print(
+                f"error: --skip-gas-bump needs the pre-bumped snapshot at {bumped}, "
+                "which does not exist. Build it once with `--prepare-baseline` "
+                "(or set besu.bumped_snapshot_dir to its location).",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"skip-gas-bump: using pre-bumped snapshot {bumped}")
+        cfg.besu.data_snapshot_dir = bumped
 
     if args.compare:
         image_x = args.image_x or cfg.besu.image

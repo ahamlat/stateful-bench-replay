@@ -78,31 +78,44 @@ First call bootstraps `./venv/` from `requirements.txt` automatically.
 ### Skip the gas-bump prelude (pre-bumped snapshots)
 
 The prelude normally builds the chain bottom-up: `snapshot tip → gas-bump
-(5000 blocks) → funding (1 block) → tests`, replayed before **every** test. If
-your snapshot was captured **after** the gas-bump blocks were already applied
-(its tip *is* the gas-bump tip), replaying `gas-bump.txt` is redundant. Skip it:
+(5000 blocks) → funding (1 block) → tests`, replayed before **every** test —
+expensive, since the 5000-block gas-bump runs once per test. If you have a
+snapshot whose tip *is* the gas-bump tip, replaying `gas-bump.txt` is redundant.
+
+The workflow is two steps, and once set up you toggle between the two baselines
+with a **single flag — no `config.yaml` edits**:
+
+1. Build the pre-bumped snapshot once (see below), then
+2. add `--skip-gas-bump` to any run:
 
 ```bash
-# CLI (overrides the config for this run)
+# pristine baseline + gas-bump replayed per test
+./runBenchmark.sh --filter '*sload_bloated*' --limit 1
+
+# pre-bumped baseline + gas-bump skipped — same command + one flag
 ./runBenchmark.sh --skip-gas-bump --filter '*sload_bloated*' --limit 1
 ```
 
-```yaml
-# or make it the default in config.yaml
-run:
-  skip_gas_bump: true
-```
+`--skip-gas-bump` (or `run.skip_gas_bump: true`) does two things on OverlayFS:
 
-When set, the runner drops `input.gas_bump_file` (default `gas-bump.txt`) from
-the prelude, so only the remaining entries (e.g. `funding.txt`) are replayed —
-`funding` then chains straight onto the snapshot tip. It works with every mode
-(`--compare`, `--profile`, both reset backends) and prints what it removed at
-startup (`skip-gas-bump: omitting prelude file(s) ['gas-bump.txt'] …`).
+- drops `input.gas_bump_file` (default `gas-bump.txt`) from the prelude, so only
+  the remaining entries (e.g. `funding.txt`) replay — `funding` chains straight
+  onto the snapshot tip; and
+- switches the baseline from `data_snapshot_dir` to the **pre-bumped snapshot**
+  (`besu.bumped_snapshot_dir`, default `<data_snapshot_dir>-bumped`) so you do
+  not edit the snapshot path by hand.
 
-> Use this **only** when the snapshot really contains the gas-bumped blocks. If
-> it doesn't, `funding`/the tests fail with `SYNCING` (missing parent), because
-> their `parentHash` points at the gas-bump tip. If your gas-bump file has a
-> different name, set `input.gas_bump_file` to match.
+It works with every mode (`--compare`, `--profile`) and prints what it did at
+startup (`skip-gas-bump: omitting prelude file(s) ['gas-bump.txt'] …` and
+`skip-gas-bump: using pre-bumped snapshot /data/besu-bumped`). If the pre-bumped
+snapshot doesn't exist yet, the run aborts and tells you to `--prepare-baseline`.
+
+> Use this **only** when the pre-bumped snapshot really contains the gas-bumped
+> blocks. If it doesn't, `funding`/the tests fail with `SYNCING` (missing
+> parent), because their `parentHash` points at the gas-bump tip. If your
+> gas-bump file has a different name, set `input.gas_bump_file` to match; for
+> schelk, `--skip-gas-bump` only trims the prelude (the baseline is the virgin
+> device, so bake the bump there).
 
 #### Building the pre-bumped snapshot (`--prepare-baseline`, OverlayFS)
 
@@ -113,27 +126,26 @@ one-time prepare step. It resets+mounts the overlay, starts Besu, replays
 original `data_snapshot_dir` is left untouched). It runs no tests.
 
 ```bash
-# Writes /data/besu-bumped by default (<data_snapshot_dir>-bumped)
+# Writes /data/besu-bumped by default (= besu.bumped_snapshot_dir, which
+# defaults to <data_snapshot_dir>-bumped) — exactly where --skip-gas-bump
+# looks, so no further config is needed.
 ./runBenchmark.sh --prepare-baseline
 
-# or choose where it lands
+# or choose where it lands (then set besu.bumped_snapshot_dir to match)
 ./runBenchmark.sh --prepare-baseline --baseline-out /data/besu-gasbumped
 ```
 
-Then point the snapshot at the result and skip the gas-bump from now on:
+After that, `--skip-gas-bump` automatically uses it — no `config.yaml` edit:
 
-```yaml
-besu:
-  data_snapshot_dir: /data/besu-bumped   # the pre-bumped snapshot
-run:
-  skip_gas_bump: true                    # funding still replays per test
+```bash
+./runBenchmark.sh --skip-gas-bump --filter '*sload_bloated*' --limit 1
 ```
 
-Because the original snapshot is preserved, flipping `data_snapshot_dir` (and
-`skip_gas_bump`) is how you choose between the pristine and pre-bumped
-baselines. Artefacts (events log, `besu-prepare.log`, `summary.json`) land in
-`runs/<timestamp>-prepare/`. This mode is OverlayFS-only; for schelk you bake
-the gas-bump into the virgin block device and re-run `schelk init`.
+The original snapshot is preserved, so adding/removing `--skip-gas-bump` is how
+you switch between the pristine and pre-bumped baselines. Artefacts (events log,
+`besu-prepare.log`, `summary.json`) land in `runs/<timestamp>-prepare/`. This
+mode is OverlayFS-only; for schelk you bake the gas-bump into the virgin block
+device and re-run `schelk init`.
 
 ## 4. Inspect results
 
