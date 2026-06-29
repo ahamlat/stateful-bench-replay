@@ -467,6 +467,10 @@ async function launch(kind, tests) {
     }
     closeModal();
     toast(`${kind} launched (${resp.job.n_tests} tests)`, "ok");
+    // Clear the selection so the next launch starts fresh (otherwise it would
+    // accumulate the previously-launched tests).
+    state.selected.clear();
+    renderActionBar();
     switchTab("jobs");
     refreshJobs(true);
     selectJob(resp.job.id);
