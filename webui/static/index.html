@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stateful Replay — Benchmark Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◧</span>
+      <div>
+        <div class="title">Stateful Replay <span class="dim">Benchmark Console</span></div>
+        <div class="subtitle" id="config-line">loading config…</div>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="explorer">Tests</button>
+      <button class="tab" data-tab="runs">Runs &amp; Results</button>
+      <button class="tab" data-tab="jobs">Jobs <span class="badge" id="jobs-badge" hidden>0</span></button>
+    </nav>
+    <div class="topbar-actions">
+      <span class="conn" id="conn-dot" title="connection"></span>
+      <button class="btn ghost" id="reload-config" title="reload config.yaml">⟳ config</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============ EXPLORER ============ -->
+    <section class="view" id="view-explorer">
+      <div class="panel search-panel">
+        <div class="search-row">
+          <input type="search" id="search" placeholder="Filter tests…  e.g.  account_access  opcode=CALL  gas=160M" autocomplete="off">
+          <div class="threshold">
+            <label>Slow threshold</label>
+            <input type="range" id="threshold" min="0" max="1000" step="10" value="0">
+            <input type="number" id="threshold-num" min="0" step="10" value="0">
+            <span class="unit">MGas/s</span>
+          </div>
+        </div>
+        <div class="search-meta" id="search-meta"></div>
+      </div>
+
+      <div class="panel" id="facets-panel">
+        <div class="panel-head">
+          <h3>Filter facets <span class="dim" id="facets-summary"></span></h3>
+          <button class="btn ghost sm" id="clear-facets">clear</button>
+        </div>
+        <div id="facets"></div>
+      </div>
+
+      <div class="panel" id="heatmap-panel">
+        <div class="panel-head">
+          <h3>Performance heatmap</h3>
+          <div class="controls">
+            <span class="lbl">Sort</span>
+            <div class="seg" id="heat-sort">
+              <button data-v="order" class="active">Name</button>
+              <button data-v="mgas">MGas/s</button>
+              <button data-v="gas">Gas</button>
+            </div>
+            <span class="dim" id="heat-meta"></span>
+          </div>
+        </div>
+        <div id="heatmap" class="heatmap"></div>
+        <div class="heat-legend">
+          <span>slow</span><span class="bar"></span><span>fast</span>
+          <span class="dim" id="heat-range"></span>
+        </div>
+      </div>
+
+      <div class="panel" id="list-panel">
+        <div class="panel-head">
+          <h3>Tests <span class="dim" id="list-count"></span></h3>
+          <div class="controls">
+            <label class="check"><input type="checkbox" id="select-all"> select filtered</label>
+            <button class="btn ghost sm" id="clear-sel">clear selection</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="tests-table">
+            <thead>
+              <tr>
+                <th class="c-check"></th>
+                <th data-sort="name">Test</th>
+                <th data-sort="mgas" class="num">MGas/s</th>
+                <th data-sort="lat" class="num">Lat (ms)</th>
+                <th data-sort="gas" class="num">Gas</th>
+              </tr>
+            </thead>
+            <tbody id="tests-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ RUNS ============ -->
+    <section class="view" id="view-runs" hidden>
+      <div class="split">
+        <div class="panel runs-list-panel">
+          <div class="panel-head">
+            <h3>Runs</h3>
+            <button class="btn ghost sm" id="refresh-runs">⟳</button>
+          </div>
+          <div id="runs-list" class="runs-list"></div>
+        </div>
+        <div class="panel run-detail-panel">
+          <div id="run-detail" class="run-detail">
+            <div class="empty">Select a run to see its results.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ JOBS ============ -->
+    <section class="view" id="view-jobs" hidden>
+      <div class="split">
+        <div class="panel jobs-list-panel">
+          <div class="panel-head"><h3>Jobs</h3><button class="btn ghost sm" id="refresh-jobs">⟳</button></div>
+          <div id="jobs-list" class="runs-list"></div>
+        </div>
+        <div class="panel job-detail-panel">
+          <div id="job-detail" class="run-detail">
+            <div class="empty">Select a job to follow its live log.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ ACTION BAR ============ -->
+  <div class="actionbar" id="actionbar" hidden>
+    <div class="sel-info"><strong id="sel-count">0</strong> selected</div>
+    <div class="spacer"></div>
+    <button class="btn" id="open-run">▶ Run selected</button>
+    <button class="btn primary" id="open-compare">⇄ Compare versions</button>
+  </div>
+
+  <!-- ============ MODAL ============ -->
+  <div class="modal-backdrop" id="modal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="modal-title">Launch</h3>
+        <button class="btn ghost sm" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

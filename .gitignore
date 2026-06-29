@@ -6,3 +6,4 @@ venv/
 runs/
 config.yaml
 .DS_Store
+webui/jobs/

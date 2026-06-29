@@ -37,6 +37,7 @@ Everything is driven by `./runBenchmark.sh`, a thin wrapper that bootstraps
 | `--filter, -f '<glob>'` | Run only tests whose name matches the glob (e.g. `'*sload_bloated*'`). |
 | `--limit, -n N` | Run at most `N` tests after filtering (`--limit 1` for a single test). |
 | `--pick, -p` | List the matched tests and prompt to pick exactly one (interactive). |
+| `--tests-from FILE` | Run exactly the test basenames listed in `FILE` (one per line), in that order. Overrides `--filter`/`tests.order`. Used by the [web console](#web-console-ui) to run an arbitrary multi-selection. |
 | `--dry-run` | Resolve config + the test list and exit without touching the system. |
 | `--config, -c FILE` | Use a different config file (default `config.yaml`). |
 
@@ -312,6 +313,55 @@ summary.json      # per-version ok/fail tallies + comparison summary
 Open `comparison.html` in any browser (no external assets). Rows sort
 worst-throughput-regression first; green = *y* faster, red = *y* slower.
 `--compare --dry-run` resolves the test list without starting a container.
+
+---
+
+## Web console (UI)
+
+A spamoor-style web console lets you browse the test corpus, run an arbitrary
+selection, compare two Besu versions on that selection, and read the results —
+all from a browser. It runs **on the VM** (where `run.py`, the snapshot and
+docker live) and you reach it over an SSH port-forward.
+
+```bash
+# On the VM (reuses the same venv as runBenchmark.sh):
+./runWebUI.sh                       # serves http://127.0.0.1:8765
+./runWebUI.sh --port 9000           # different port
+CONFIG=staging.yaml ./runWebUI.sh   # different config
+
+# On your laptop:
+ssh -N -L 8765:127.0.0.1:8765 <vm>
+# then open http://127.0.0.1:8765
+```
+
+It binds to `127.0.0.1` by default (only reachable through the tunnel). Use
+`--host 0.0.0.0` only if you really want it on the network.
+
+**What it does**
+
+- **Tests** — a faceted explorer over all ~550 tests. Facets (file, opcode,
+  gas, value_sent, account_mode, cache_strategy, fork, …) are parsed from the
+  test names; filter by clicking chips or typing in the search box
+  (`opcode=CALL gas=160M`). A performance heatmap colours each test by its
+  latest known Mgas/s. Tick the tests you want (or "select filtered").
+- **Run** — launch the selected tests as a normal sweep on the configured
+  image, with the usual toggles (reset backend, skip-gas-bump, persist-prelude,
+  profile, dry-run).
+- **Compare** — run the selection twice (image *x* vs *y*) and get the same
+  diff `--compare` produces.
+- **Runs & Results** — every `runs/<ts>/` is listed; open one to see the
+  comparison table (colour-coded Δ Mgas/s + latency) or the per-test sweep
+  status, the events tail, failures, and links to download the raw
+  `comparison.html` / Besu logs.
+- **Jobs** — live log tail of running/finished launches, with a cancel button.
+
+Under the hood the UI shells out to `run.py` and passes the multi-selection via
+the new `--tests-from FILE` flag (one test basename per line). Nothing is
+re-implemented: discovery, replay, comparison and log parsing all come from
+`run.py`, so the console and the CLI always agree.
+
+> The console reads results straight from `runs/` and the saved Besu logs, so
+> it works on completed runs too — including ones you launched from the CLI.
 
 ---
 
