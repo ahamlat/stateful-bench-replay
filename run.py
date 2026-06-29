@@ -1094,8 +1094,15 @@ def replay_file(
 # Test discovery
 # ---------------------------------------------------------------------------
 
-def discover_tests(cfg: Config, filter_override: str | None, limit: int | None) -> list[str]:
-    """Return ordered list of basenames present in BOTH setup/ and testing/ that match the filter."""
+def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
+                   explicit: list[str] | None = None) -> list[str]:
+    """Return ordered list of basenames present in BOTH setup/ and testing/ that match the filter.
+
+    When `explicit` is given (e.g. an arbitrary multi-selection from the web
+    UI via --tests-from), it overrides the glob filter and `tests.order`: only
+    the named tests are kept, in the order given, intersected with the valid
+    setup/testing pairs. `limit` still applies last.
+    """
     pattern = filter_override or cfg.tests.filter
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
@@ -1113,6 +1120,29 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None) 
         print(f"warn: {len(only_setup)} files in setup/ have no testing/ pair (skipped)", file=sys.stderr)
     if only_testing:
         print(f"warn: {len(only_testing)} files in testing/ have no setup/ pair (skipped)", file=sys.stderr)
+
+    if explicit is not None:
+        # Explicit selection: preserve the requested order, keep only valid
+        # pairs, drop unknowns with a warning. Glob filter / tests.order are
+        # ignored on purpose so the web UI gets exactly what it asked for.
+        seen: set[str] = set()
+        selected: list[str] = []
+        missing: list[str] = []
+        for n in explicit:
+            if n in seen:
+                continue
+            seen.add(n)
+            if n in paired:
+                selected.append(n)
+            else:
+                missing.append(n)
+        if missing:
+            preview = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+            print(f"warn: {len(missing)} requested test(s) are not valid setup/testing "
+                  f"pairs and were skipped: {preview}", file=sys.stderr)
+        if limit is not None and limit >= 0:
+            selected = selected[:limit]
+        return selected
 
     matched = sorted(n for n in paired if fnmatch.fnmatch(n, pattern))
     order = cfg.tests.order
@@ -1235,13 +1265,13 @@ def bake_prelude_layer(
 
 
 def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
-              pick: bool, dry_run: bool) -> int:
+              pick: bool, dry_run: bool, select: list[str] | None = None) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_root = cfg.run.log_dir / timestamp
     log = SweepLog(log_root)
     log.event(f"sweep start, log dir = {log_root}")
 
-    tests = discover_tests(cfg, filter_override, limit)
+    tests = discover_tests(cfg, filter_override, limit, explicit=select)
     log.event(
         f"matched {len(tests)} tests "
         f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
@@ -2363,6 +2393,7 @@ def run_compare(
     filter_override: str | None,
     limit: int | None,
     dry_run: bool,
+    select: list[str] | None = None,
 ) -> int:
     """Compare-mode entry point.
 
@@ -2376,7 +2407,7 @@ def run_compare(
     log.event(f"  x: label={label_x!r} image={image_x!r}")
     log.event(f"  y: label={label_y!r} image={image_y!r}")
 
-    tests = discover_tests(cfg, filter_override, limit)
+    tests = discover_tests(cfg, filter_override, limit, explicit=select)
     log.event(
         f"matched {len(tests)} tests "
         f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
@@ -2555,6 +2586,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="run at most N tests after filtering (use --limit 1 for a single test)")
     p.add_argument("--pick", "-p", action="store_true",
                    help="list matched tests and prompt to pick exactly one (interactive)")
+    p.add_argument("--tests-from", default=None, metavar="FILE",
+                   help="run exactly the test basenames listed in FILE (one per "
+                        "line, '#' comments allowed), in that order. Overrides "
+                        "--filter and tests.order; used by the web UI to run an "
+                        "arbitrary multi-selection. Still intersected with the "
+                        "valid setup/testing pairs; --limit still applies.")
     p.add_argument("--dry-run", action="store_true",
                    help="resolve config + selected tests, then exit without touching the system")
     p.add_argument("--profile", action="store_true",
@@ -2716,6 +2753,23 @@ def main(argv: list[str] | None = None) -> int:
 
     _install_sigint_handler()
 
+    # Explicit test selection (web UI multi-select via --tests-from). Read the
+    # newline-delimited basenames once here and pass them to both run modes.
+    select: list[str] | None = None
+    if args.tests_from:
+        tf = _abs_path(args.tests_from)
+        if not tf.is_file():
+            print(f"error: --tests-from file not found: {tf}", file=sys.stderr)
+            return 2
+        select = [
+            ln.strip() for ln in tf.read_text().splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")
+        ]
+        if not select:
+            print(f"error: --tests-from file is empty: {tf}", file=sys.stderr)
+            return 2
+        print(f"tests-from: {len(select)} explicitly selected test(s) from {tf}")
+
     if args.prepare_baseline:
         return run_prepare_baseline(
             cfg,
@@ -2767,11 +2821,11 @@ def main(argv: list[str] | None = None) -> int:
             image_x=image_x, image_y=image_y,
             label_x=label_x, label_y=label_y,
             filter_override=args.filter, limit=args.limit,
-            dry_run=args.dry_run,
+            dry_run=args.dry_run, select=select,
         )
 
     return run_sweep(cfg, filter_override=args.filter, limit=args.limit,
-                     pick=args.pick, dry_run=args.dry_run)
+                     pick=args.pick, dry_run=args.dry_run, select=select)
 
 
 if __name__ == "__main__":
