@@ -778,6 +778,16 @@ def mount_baseline(cfg: Config, log: SweepLog) -> None:
         overlay_mount_all(cfg.besu, log)
 
 
+def schelk_promote(cfg: Config, log: SweepLog) -> None:
+    """Make the current scratch state the new schelk (virgin) baseline.
+
+    schelk-only. Copies the blocks the gas-bump wrote onto the virgin device,
+    so every later `restore` rolls back to the gas-bumped state. Used by
+    --prepare-baseline; it OVERWRITES virgin in place.
+    """
+    _schelk("promote", cfg, log)
+
+
 def per_test_reset(cfg: Config, log: SweepLog) -> None:
     """Reset on-disk state before a single test.
 
@@ -1443,21 +1453,13 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 # ---------------------------------------------------------------------------
 
 def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
-    """Build a new snapshot directory that already contains the gas-bump blocks.
+    """Bake the gas-bump blocks into the pristine baseline, once.
 
-    OverlayFS only. Flow: reset+mount the overlay, start Besu, replay ONLY the
-    gas-bump file (input.gas_bump_file), stop Besu so RocksDB is flushed, then
-    rsync the flattened <overlay_dir>/test/merged view into `baseline_out`. The
-    original snapshot dir is never modified, so you switch baselines just by
-    pointing besu.data_snapshot_dir at the new directory and running with
-    --skip-gas-bump (funding stays in the prelude and chains onto the bump tip).
+    Dispatches on the reset backend. Either way it replays ONLY the gas-bump
+    file (input.gas_bump_file), runs no tests, and leaves a baseline that
+    --skip-gas-bump can use so the 5000-block gas-bump is no longer replayed
+    before every test.
     """
-    if cfg.run.reset_backend != "overlayfs":
-        print("error: --prepare-baseline currently supports only the overlayfs "
-              "backend. For schelk, bake the gas-bump into the virgin block "
-              "device and re-run `schelk init` instead.", file=sys.stderr)
-        return 2
-
     gas_bump = cfg.input.gas_bump_file
     src = cfg.input.dir / gas_bump
     if not src.is_file():
@@ -1465,6 +1467,23 @@ def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
               "(set input.gas_bump_file to the right name).", file=sys.stderr)
         return 2
 
+    if cfg.run.reset_backend == "schelk":
+        return _prepare_baseline_schelk(cfg, src, gas_bump, baseline_out)
+
+    return _prepare_baseline_overlayfs(cfg, src, gas_bump, baseline_out)
+
+
+def _prepare_baseline_overlayfs(
+    cfg: Config, src: Path, gas_bump: str, baseline_out: Path | None
+) -> int:
+    """Build a new snapshot directory that already contains the gas-bump blocks.
+
+    Flow: reset+mount the overlay, start Besu, replay ONLY the gas-bump file,
+    stop Besu so RocksDB is flushed, then rsync the flattened
+    <overlay_dir>/test/merged view into `baseline_out`. The original snapshot
+    dir is never modified, so you switch baselines just by running with
+    --skip-gas-bump (funding stays in the prelude and chains onto the bump tip).
+    """
     out = (baseline_out or _bumped_snapshot_dir(cfg)).expanduser()
     # Never clobber the source baseline or the live overlay scratch root.
     for forbidden, why in (
@@ -1569,6 +1588,102 @@ def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
     print("Use it for future sweeps by setting, in config.yaml:")
     print(f"  besu:\n    data_snapshot_dir: {out}")
     print("  run:\n    skip_gas_bump: true      # or pass --skip-gas-bump on the CLI")
+    return 0
+
+
+def _prepare_baseline_schelk(
+    cfg: Config, src: Path, gas_bump: str, baseline_out: Path | None
+) -> int:
+    """Bake the gas-bump into the schelk baseline (the virgin device), in place.
+
+    schelk has a single baseline (virgin), so there is no separate "bumped"
+    directory like OverlayFS: instead we replay the gas-bump onto scratch and
+    `schelk promote` it, copying the written blocks onto virgin. Every later
+    `restore` then rolls back to the gas-bumped state, so --skip-gas-bump can
+    drop the gas-bump from the per-test prelude. This OVERWRITES virgin: the
+    pristine pre-bump baseline is gone until you reload the snapshot and re-init.
+    """
+    if baseline_out is not None:
+        print("warn: --baseline-out is ignored for the schelk backend; the "
+              "gas-bump is promoted into the virgin device in place "
+              f"({cfg.schelk.virgin}).", file=sys.stderr)
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = SweepLog(cfg.run.log_dir / f"{timestamp}-prepare")
+    log.event(f"prepare-baseline (schelk) start: replay {gas_bump}, then promote "
+              f"scratch -> virgin {cfg.schelk.virgin}")
+
+    # Focused preflight (mirrors run_sweep, minus the per-test machinery).
+    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
+    for spec in cfg.besu.extra_mounts:
+        host = spec.split(":", 1)[0]
+        if not host or not Path(host).exists():
+            raise FileNotFoundError(
+                f"besu.extra_mounts host path does not exist: {host!r} "
+                f"(from spec {spec!r})."
+            )
+    _reset_script = reset_script(cfg)
+    for probe, hint in (
+        (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
+        (["sudo", "-n", str(_reset_script), "--help"], f"sudo -n {_reset_script} --help"),
+    ):
+        try:
+            _run(probe, capture=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"`{hint}` failed with exit {e.returncode}: {(e.stderr or '').strip()}"
+            ) from None
+
+    secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    started = False
+    ok = False
+    try:
+        with requests.Session() as session:
+            # Start from the pristine virgin baseline on scratch.
+            reset_to_baseline(cfg, log)
+            start_besu(cfg.besu, log)
+            started = True
+            wait_for_engine(cfg.besu, secret, log)
+            log_chain_head(cfg.besu, log, "head BEFORE gas-bump")
+            ok = replay_file(cfg, secret, session, src, log, phase="prepare")
+            if ok:
+                log_chain_head(cfg.besu, log, "head AFTER gas-bump")
+            save_container_logs(
+                cfg.besu.container_name,
+                log.root / f"besu-prepare{'' if ok else '-FAIL'}.log", log,
+            )
+            # Stop Besu so RocksDB flushes onto scratch before we promote the
+            # written blocks onto virgin.
+            stop_container(cfg.besu.container_name)
+            started = False
+            if not ok:
+                log.event("prepare-baseline: gas-bump replay failed; virgin NOT promoted")
+            else:
+                schelk_promote(cfg, log)
+                log.event("prepare-baseline: promoted gas-bumped scratch onto the "
+                          f"virgin baseline {cfg.schelk.virgin}")
+        log.event(f"prepare-baseline end: ok={ok}")
+    finally:
+        if started and cfg.run.stop_container_on_exit:
+            log.event(f"stopping container {cfg.besu.container_name}")
+            stop_container(cfg.besu.container_name)
+        log.flush_summary({
+            "prepare_baseline": True,
+            "backend": "schelk",
+            "ok": ok,
+            "gas_bump_file": gas_bump,
+            "virgin": cfg.schelk.virgin,
+        })
+        log.close()
+
+    if not ok:
+        print("prepare-baseline failed: see the events log and besu-prepare-FAIL.log "
+              f"in {log.root}", file=sys.stderr)
+        return 1
+    print()
+    print(f"Gas-bump baked into the schelk virgin device: {cfg.schelk.virgin}")
+    print("Run future sweeps/compares with --skip-gas-bump (or run.skip_gas_bump:")
+    print("true) so the gas-bump is no longer replayed before every test.")
     return 0
 
 
@@ -2446,8 +2561,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--skip-gas-bump", "--no-gas-bump", dest="skip_gas_bump",
                    action="store_true", default=None,
                    help="skip the gas-bump prelude file (input.gas_bump_file); use "
-                        "when the snapshot ALREADY contains the gas-bumped blocks. "
-                        "Overrides run.skip_gas_bump.")
+                        "when the baseline ALREADY contains the gas-bumped blocks "
+                        "(build it once with --prepare-baseline). Works on both "
+                        "backends: overlayfs swaps to the pre-bumped snapshot dir, "
+                        "schelk rolls back to the pre-bumped virgin device. Combine "
+                        "with --compare for a gas-bump-free comparison. Overrides "
+                        "run.skip_gas_bump.")
     p.add_argument("--persist-prelude", dest="persist_prelude",
                    action="store_true", default=None,
                    help="(overlayfs) bake input.gas_bump_file ONCE into a persistent "
@@ -2457,15 +2576,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "dropped from the per-test prelude. Overrides "
                         "run.persist_prelude.")
     p.add_argument("--prepare-baseline", action="store_true",
-                   help="(overlayfs) bake the gas-bump blocks into a new snapshot "
-                        "directory so later sweeps can run with --skip-gas-bump. "
-                        "Resets+mounts the overlay, starts Besu, replays ONLY "
-                        "input.gas_bump_file, stops Besu, then rsyncs the flattened "
-                        "result into --baseline-out. Runs no tests; the original "
-                        "snapshot dir is left untouched.")
+                   help="bake the gas-bump blocks into the baseline once so later "
+                        "runs can use --skip-gas-bump. Resets the baseline, starts "
+                        "Besu, replays ONLY input.gas_bump_file, stops Besu, then: "
+                        "(overlayfs) rsyncs the flattened result into a NEW snapshot "
+                        "dir (--baseline-out), leaving the original untouched; "
+                        "(schelk) `schelk promote`s the gas-bumped scratch onto the "
+                        "virgin device IN PLACE. Runs no tests.")
     p.add_argument("--baseline-out", default=None, metavar="DIR",
-                   help="output directory for --prepare-baseline "
-                        "(default: <besu.data_snapshot_dir>-bumped).")
+                   help="output directory for --prepare-baseline on overlayfs "
+                        "(default: <besu.data_snapshot_dir>-bumped). Ignored for "
+                        "schelk, which promotes the virgin device in place.")
 
     # --- compare mode (run the suite twice on two Besu images, diff the times) ---
     p.add_argument("--compare", action="store_true",
@@ -2551,7 +2672,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "error: --persist-prelude is OverlayFS-only (it bakes the gas-bump into "
             "the prelude overlay layer). For the schelk backend, bake the gas-bump "
-            "into the virgin device instead.",
+            "into the virgin device once with `--prepare-baseline`, then run with "
+            "`--skip-gas-bump`.",
             file=sys.stderr,
         )
         return 2
@@ -2568,8 +2690,12 @@ def main(argv: list[str] | None = None) -> int:
                              if Path(f).name != cfg.input.gas_bump_file]
         removed = [f for f in before if f not in cfg.input.prelude]
         if removed:
-            where = ("the pre-bumped snapshot" if cfg.run.skip_gas_bump
-                     else "the persistent prelude layer")
+            if cfg.run.persist_prelude:
+                where = "the persistent prelude layer"
+            elif cfg.run.reset_backend == "schelk":
+                where = "the pre-bumped virgin device"
+            else:
+                where = "the pre-bumped snapshot"
             print(f"{mode}: omitting prelude file(s) {removed} from the per-test "
                   f"prelude (replayed once into {where}). per-test prelude is now "
                   f"{cfg.input.prelude or '[]'}")
@@ -2602,6 +2728,13 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"skip-gas-bump: using pre-bumped snapshot {bumped}")
         cfg.besu.data_snapshot_dir = bumped
+    elif cfg.run.skip_gas_bump and cfg.run.reset_backend == "schelk":
+        # schelk's baseline is the virgin device, which must already contain the
+        # gas-bump (bake it once with `--prepare-baseline`). There is no dir to
+        # swap, so the per-test reset (schelk restore) already rolls back to it.
+        print(f"skip-gas-bump: using the schelk virgin device {cfg.schelk.virgin} as "
+              "the pre-bumped baseline (run --prepare-baseline once to bake the "
+              "gas-bump into it).")
 
     if args.compare:
         image_x = args.image_x or cfg.besu.image
