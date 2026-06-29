@@ -318,8 +318,30 @@ def _absorb_comparison(cmp_json: Path, run_id: str, out: dict) -> None:
 
 
 def _absorb_sweep(rd: Path, out: dict) -> None:
+    for name, rec in sweep_metrics(rd).items():
+        if name in out:
+            continue
+        out[name] = {
+            "mgas": rec.get("mgas"),
+            "lat": rec.get("lat"),
+            "gas": rec.get("gas"),
+            "run": rd.name,
+            "kind": "sweep",
+            "labels": [],
+        }
+
+
+def sweep_metrics(rd: Path) -> dict:
+    """Per-test metrics parsed from THIS sweep run's own Besu logs.
+
+    Returns {test_name: {mgas, lat, gas, ok, log}} where the values come from
+    the LAST 'Imported #' block of that test's container log (the measured
+    testing block), exactly like run.py's compare mode. Latency is the block
+    exec time in ms. `ok` is False when the log file carries the -FAIL suffix.
+    """
+    out: dict[str, dict] = {}
     if runner is None:
-        return
+        return out
     sel = rd / "selected_tests.txt"
     names: list[str] = []
     if sel.is_file():
@@ -327,29 +349,29 @@ def _absorb_sweep(rd: Path, out: dict) -> None:
             names = [ln.strip() for ln in sel.read_text().splitlines() if ln.strip()]
         except OSError:
             names = []
-    for log in rd.glob("besu-*.log"):
+    # Only per-test sweep logs match `besu-<NNNN>-...`; compare logs
+    # (`besu-<label>-NNNN-...`) and prelude-bake logs are skipped.
+    for log in sorted(rd.glob("besu-*.log")):
         m = re.match(r"besu-(\d+)-", log.name)
         if not m:
             continue
         idx = int(m.group(1))
         name = names[idx - 1] if 0 < idx <= len(names) else None
-        if not name or name in out:
+        if not name:
             continue
+        failed = log.name.endswith("-FAIL.log")
         try:
             metrics = runner._parse_last_imported(log)
         except Exception:
             metrics = None
-        if not metrics:
-            continue
-        out[name] = {
-            "mgas": metrics.get("mgas_s"),
-            "lat": (metrics.get("exec_s") * 1000.0
-                    if isinstance(metrics.get("exec_s"), (int, float)) else None),
-            "gas": metrics.get("gas_used"),
-            "run": rd.name,
-            "kind": "sweep",
-            "labels": [],
-        }
+        rec = {"ok": not failed, "log": log.name}
+        if metrics:
+            ex = metrics.get("exec_s")
+            rec["mgas"] = metrics.get("mgas_s")
+            rec["lat"] = ex * 1000.0 if isinstance(ex, (int, float)) else None
+            rec["gas"] = metrics.get("gas_used")
+        out[name] = rec
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -410,6 +432,10 @@ def run_details(state: AppState, run_id: str) -> dict | None:
     cmp_json = _read_json(rd / "comparison.json")
     if cmp_json:
         detail["comparison"] = cmp_json
+    else:
+        # Sweep: metrics parsed from THIS run's logs (not the global aggregate),
+        # so the per-test numbers match the run's own Besu logs.
+        detail["metrics"] = sweep_metrics(rd)
     # selected tests
     sel = rd / "selected_tests.txt"
     if sel.is_file():

@@ -478,11 +478,16 @@ function closeModal() { $("#modal").hidden = true; }
 
 /* ---------------------------------------------------------------- jobs */
 async function refreshJobs(force) {
+  const prevRunning = (state.jobsCache || []).filter((j) => j.status === "running").length;
   try {
     const data = await api("/api/jobs");
     state.jobsCache = data.jobs || [];
   } catch (e) { return; }
   const running = state.jobsCache.filter((j) => j.status === "running").length;
+  if (running < prevRunning) {
+    // A job just finished: refresh the explorer's metrics from new results.
+    loadMetrics().then(() => { renderHeatmap(); renderList(); });
+  }
   const badge = $("#jobs-badge");
   badge.hidden = running === 0; badge.textContent = running;
   if (!$("#view-jobs").hidden || force) renderJobsList();
@@ -631,8 +636,8 @@ function renderComparison(cmp) {
 
 function renderSweep(d) {
   const sel = d.selected_tests || [];
+  const metrics = d.metrics || {};      // parsed from THIS run's Besu logs
   const fails = d.failures || [];
-  const failSet = new Set(fails.map((f) => f.source).filter(Boolean));
   const totals = (d.summary && d.summary.totals) || {};
   const cards = `<div class="cards">
       <div class="mcard"><div class="k">Selected</div><div class="v">${sel.length || d.selected}</div></div>
@@ -642,12 +647,14 @@ function renderSweep(d) {
   let rows = "";
   if (sel.length) {
     rows = sel.map((name) => {
-      const m = state.metrics[name] || {};
-      const failed = [...failSet].some((s) => s && name.includes(s));
+      const m = metrics[name] || {};
+      const failed = m.ok === false;
+      const gas = typeof m.gas === "number" ? (m.gas / 1e6).toFixed(1) + "M" : "·";
       return `<tr>
         <td class="tname"><code>${esc(name)}</code></td>
         <td class="num">${typeof m.mgas === "number" ? m.mgas.toFixed(1) : "·"}</td>
         <td class="num">${typeof m.lat === "number" ? m.lat.toFixed(1) : "·"}</td>
+        <td class="num">${gas}</td>
         <td>${failed ? `<span class="tag failed">fail</span>` : `<span class="tag done">ok</span>`}</td>
       </tr>`;
     }).join("");
@@ -655,7 +662,7 @@ function renderSweep(d) {
   let html = cards;
   if (rows) html += `<div class="section-title">Selected tests</div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Test</th><th class="num">MGas/s</th><th class="num">Lat (ms)</th><th>Status</th></tr></thead>
+      <thead><tr><th>Test</th><th class="num">MGas/s</th><th class="num">Lat (ms)</th><th class="num">Gas</th><th>Status</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   if (fails.length) {
     html += `<div class="section-title">Failures (${fails.length})</div><div class="log">${esc(fails.map((f) => JSON.stringify(f)).join("\n"))}</div>`;
