@@ -21,6 +21,7 @@
 #   schelk.sh reset-all   [flags]   -> schelk restore   (roll back to virgin + mount)
 #   schelk.sh reset-test  [flags]   -> schelk restore   (single baseline; same as reset-all)
 #   schelk.sh umount-all  [flags]   -> schelk recover   (roll back to virgin, leave unmounted)
+#   schelk.sh promote     [flags]   -> schelk promote   (make current scratch the new virgin baseline)
 #   schelk.sh status      [flags]   -> schelk status
 #   schelk.sh help|--help           -> this help (no root / devices needed)
 #
@@ -141,11 +142,22 @@ cmd_umount_all() {
     run_schelk recover -k
 }
 
+# promote: copy the blocks the benchmark wrote onto VIRGIN, so the current
+# scratch state becomes the new pristine baseline. Used by --prepare-baseline
+# to bake the gas-bump into the schelk baseline: every later `restore` then
+# rolls back to the gas-bumped state instead of the pre-bump snapshot.
+# This OVERWRITES virgin in place; the original pristine baseline is gone.
+cmd_promote() {
+    ensure_ramdisk
+    echo "schelk.sh: ${SCHELK_BIN} promote"
+    run_schelk promote
+}
+
 cmd_status() {
     run_schelk status
 }
 
-usage() { sed -n '2,46p' "$0"; }
+usage() { sed -n '2,49p' "$0"; }
 
 main() {
     local action="${1:-}"; shift || true
@@ -174,6 +186,7 @@ main() {
         mount-all|mount)       cmd_mount_all ;;
         reset-all|reset|reset-test) cmd_reset ;;
         umount-all|umount)     cmd_umount_all ;;
+        promote)               cmd_promote ;;
         status)                cmd_status ;;
         *) die "unknown action: $action (try --help)" ;;
     esac
