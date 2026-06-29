@@ -1745,7 +1745,11 @@ def _safe_label(label: str) -> str:
 # rather than recomputing them, so the numbers match what Besu reports.
 _IMPORTED_BLOCK_RE = re.compile(r"Imported\s+#([\d,]+)")
 _IMPORTED_GAS_RE = re.compile(r"([\d,]+)\s*\(\s*[\d.]+%\)\s*gas used")
-_IMPORTED_EXEC_RE = re.compile(r"([\d.]+)\s*s\s*exec")
+# Besu reports the block exec time either in seconds ("1.090s exec") or, on
+# newer builds, in milliseconds ("75.0ms exec"). Capture the unit so we can
+# normalise both to seconds; matching only "s" silently dropped exec_s on the
+# ms format, which broke the aggregate Mgas/s in compare reports.
+_IMPORTED_EXEC_RE = re.compile(r"([\d.]+)\s*(ms|s)\s*exec")
 _IMPORTED_MGAS_RE = re.compile(r"([\d.]+)\s*Mgas/s")
 
 
@@ -1762,10 +1766,16 @@ def _parse_imported_line(line: str) -> dict | None:
     def _int(s: str) -> int:
         return int(s.replace(",", ""))
 
+    exec_s = None
+    if m_exec:
+        val = float(m_exec.group(1))
+        # Normalise to seconds: "75.0ms" -> 0.075, "1.090s" -> 1.090.
+        exec_s = val / 1000.0 if m_exec.group(2) == "ms" else val
+
     return {
         "block": _int(m_blk.group(1)),
         "gas_used": (_int(m_gas.group(1)) if m_gas else None),
-        "exec_s": (float(m_exec.group(1)) if m_exec else None),
+        "exec_s": exec_s,
         "mgas_s": (float(m_mgas.group(1)) if m_mgas else None),
     }
 
