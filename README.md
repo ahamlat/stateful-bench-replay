@@ -90,10 +90,13 @@ sudo apt-get install -y docker.io python3-venv python3-pip rsync
 sudo systemctl enable --now docker
 sudo mkdir -p /data/besu-overlay/{prelude,test}/{upper,work,merged}
 
-# Passwordless sudo for the two commands the runner uses.
+# Passwordless sudo for the commands the runner uses. sync + tee are needed
+# by compare mode, which drops the page cache before every test.
 sudo tee /etc/sudoers.d/besu-bench >/dev/null <<EOF
 $USER ALL=(root) NOPASSWD: /home/$USER/stateful-bench-replay/scripts/overlay.sh
 $USER ALL=(root) NOPASSWD: /usr/bin/docker
+$USER ALL=(root) NOPASSWD: /usr/bin/sync
+$USER ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
 EOF
 sudo chmod 440 /etc/sudoers.d/besu-bench
 
