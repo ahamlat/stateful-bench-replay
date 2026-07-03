@@ -802,6 +802,37 @@ def per_test_reset(cfg: Config, log: SweepLog) -> None:
         reset_to_baseline(cfg, log)
 
 
+def drop_page_cache(log: SweepLog) -> None:
+    """Flush dirty pages and drop the kernel page cache (+ dentries/inodes):
+
+        sudo sync
+        echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+    Called before each test in compare mode so both versions start every
+    test from an equally cold page cache instead of whatever the previous
+    test left behind. Failures are logged but non-fatal: the sweep is still
+    valid, just with a warmer cache (add `sync` and
+    `tee /proc/sys/vm/drop_caches` to the sudoers allowlist to fix).
+    """
+    log.event("drop caches: sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches")
+    res = subprocess.run(["sudo", "-n", "sync"], capture_output=True, text=True)
+    if res.returncode != 0:
+        log.event(
+            f"warn: `sudo -n sync` failed ({res.returncode}): "
+            f"{(res.stderr or res.stdout or '').strip()}"
+        )
+        return
+    res = subprocess.run(
+        ["sudo", "-n", "tee", "/proc/sys/vm/drop_caches"],
+        input="3", capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        log.event(
+            f"warn: `echo 3 | sudo -n tee /proc/sys/vm/drop_caches` failed "
+            f"({res.returncode}): {(res.stderr or res.stdout or '').strip()}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # JWT + Engine API
 # ---------------------------------------------------------------------------
@@ -1949,6 +1980,10 @@ def _run_version(
                 log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
 
                 per_test_reset(cfg, log)
+                # Cold-cache guarantee: flush + drop the page cache before
+                # every test so neither version benefits from state cached
+                # by the previous test/version.
+                drop_page_cache(log)
                 start_besu(cfg.besu, log)
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
