@@ -664,7 +664,16 @@ def start_besu(
     docker_cmd.append(f"--data-path={cfg.container_data_path}")
     docker_cmd += cfg.extra_args
     log.event("docker run: " + " ".join(shlex.quote(a) for a in docker_cmd))
-    _run(docker_cmd, capture=True)
+    res = _run(docker_cmd, capture=True, check=False)
+    if res.returncode != 0:
+        # Surface docker's own error message (image missing, pull failure,
+        # bad flag, ...) instead of a bare CalledProcessError whose captured
+        # stderr is never printed.
+        err = (res.stderr or res.stdout or "").strip()
+        log.event(f"docker run FAILED ({res.returncode}): {err}")
+        raise RuntimeError(
+            f"docker run exited {res.returncode} for image {cfg.image}: {err}"
+        )
 
 
 # ---------------------------------------------------------------------------
