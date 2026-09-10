@@ -133,6 +133,42 @@ class StatefulFixtureInputTests(unittest.TestCase):
                 log.close()
             self.assertEqual(dest.read_text(), '{"config":{}}')
 
+    def test_rpc_method_reads_prefix_only(self):
+        huge = '{"jsonrpc":"2.0","method":"engine_newPayloadV5","params":["' + ("x" * 10000) + '"]}'
+        self.assertEqual(run._rpc_method(huge), "engine_newPayloadV5")
+        self.assertEqual(run._rpc_method("not-json"), "")
+
+    def test_replay_file_streams_without_read_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pre-run.request"
+            line = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "engine_forkchoiceUpdatedV3",
+                "params": [],
+            })
+            path.write_text(line + "\n" + line + "\n")
+            log = run.SweepLog(Path(tmp) / "logs")
+            cfg = SimpleNamespace(
+                run=SimpleNamespace(fail_fast=False, request_timeout_s=1),
+                besu=SimpleNamespace(engine_url="http://127.0.0.1:8551"),
+            )
+            posted: list[str] = []
+
+            def fake_post(_cfg, _secret, _session, raw):
+                posted.append(raw)
+                return 200, {"result": {"payloadStatus": {"status": "VALID"}}}, None
+
+            original = run.post_engine_line
+            run.post_engine_line = fake_post
+            try:
+                ok = run.replay_file(cfg, b"secret", None, path, log, phase="prepare")
+            finally:
+                run.post_engine_line = original
+                log.close()
+
+            self.assertTrue(ok)
+            self.assertEqual(len(posted), 2)
+
     def test_detects_besu_rejected_options(self):
         logs = (
             "[0.056s][warning][aot] Failed to link AdapterHandlerEntry\n"

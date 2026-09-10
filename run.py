@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import jwt
@@ -1147,36 +1148,64 @@ def post_engine_line(
     return resp.status_code, body, None
 
 
-def _scan_requests(raw_lines: list[str]) -> list[tuple[int, str, str]]:
-    """Return decoded request metadata for non-empty JSON-RPC lines."""
-    out: list[tuple[int, str, str]] = []
+_RPC_METHOD_RE = re.compile(r'"method"\s*:\s*"((?:\\.|[^"\\])*)"')
+
+
+def _rpc_method(raw: str) -> str:
+    """Read the JSON-RPC method without parsing the whole payload object."""
+    match = _RPC_METHOD_RE.search(raw, 0, min(len(raw), 4096))
+    if match:
+        return match.group(1)
+    try:
+        return json.loads(raw).get("method", "?")
+    except json.JSONDecodeError:
+        return ""
+
+
+def _iter_rpc_lines(raw_lines) -> Iterable[tuple[int, str, str]]:
+    """Yield (line_no, method, raw) for non-empty JSON-RPC lines."""
     for line_no, raw in enumerate(raw_lines, start=1):
         raw = raw.strip()
         if not raw:
             continue
-        try:
-            method = json.loads(raw).get("method", "?")
-        except json.JSONDecodeError:
-            method = ""
-        out.append((line_no, method, raw))
-    return out
+        yield line_no, _rpc_method(raw), raw
+
+
+def _scan_requests(raw_lines: list[str]) -> list[tuple[int, str, str]]:
+    """Return decoded request metadata for non-empty JSON-RPC lines."""
+    return list(_iter_rpc_lines(raw_lines))
+
+
+def _last_newpayload_item_index(raw_lines) -> int:
+    """Return the 0-based index among non-empty lines of the last newPayload."""
+    last = -1
+    i = -1
+    for _line_no, method, _raw in _iter_rpc_lines(raw_lines):
+        i += 1
+        if method.startswith("engine_newPayload"):
+            last = i
+    return last
 
 
 def replay_requests(
     cfg: Config,
     secret: bytes,
     session: requests.Session,
-    raw_lines: list[str],
+    raw_lines,
     label: str,
     log: SweepLog,
     phase: str | None = None,
     profiler: ProfilerSession | None = None,
     require_all_valid: bool = False,
+    last_newpayload_idx: int | None = None,
 ) -> bool:
     """Replay JSON-RPC requests in order.
 
     `phase` is an optional human label ("setup", "testing", ...) prepended to
     the event log.
+
+    `raw_lines` may be a list or any line iterator. Do not materialize a
+    whole pre-run file; stream it from disk.
 
     By default, failures only return False when fail-fast stops replay.
     `require_all_valid` returns False after any failed request.
@@ -1188,17 +1217,17 @@ def replay_requests(
     prefix = f"replay [{phase}] " if phase else "replay "
     log.event(f"{prefix}{label}")
 
-    items = _scan_requests(raw_lines)
-
-    # Index of the LAST engine_newPayload* line, or -1 if none.
     last_np_idx = -1
-    for i, (_ln, method, _raw) in enumerate(items):
-        if method.startswith("engine_newPayload"):
-            last_np_idx = i
+    if profiler is not None:
+        if last_newpayload_idx is None:
+            last_np_idx = _last_newpayload_item_index(raw_lines)
+        else:
+            last_np_idx = last_newpayload_idx
 
     profile_active = False
     all_valid = True
-    for i, (line_no, method, raw) in enumerate(items):
+    sent = 0
+    for i, (line_no, method, raw) in enumerate(_iter_rpc_lines(raw_lines)):
         if not method:
             all_valid = False
             log.record_fail(label, line_no, "bad_json", {})
@@ -1211,6 +1240,9 @@ def replay_requests(
             profile_active = True
 
         status, body, err = post_engine_line(cfg, secret, session, raw)
+        sent += 1
+        if sent == 1 or sent % 1000 == 0:
+            log.event(f"{prefix}{label}: sent {sent} requests")
         if err is not None and body is None:
             all_valid = False
             log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
@@ -1243,6 +1275,8 @@ def replay_requests(
 
     if profile_active:
         profiler.stop()
+    if sent:
+        log.event(f"{prefix}{label}: sent {sent} requests (done)")
     return all_valid if require_all_valid else True
 
 
@@ -1256,11 +1290,20 @@ def replay_file(
     profiler: ProfilerSession | None = None,
     require_all_valid: bool = False,
 ) -> bool:
-    """Replay one line-delimited JSON-RPC file."""
-    return replay_requests(
-        cfg, secret, session, file_path.read_text().splitlines(), file_path.name,
-        log, phase=phase, profiler=profiler, require_all_valid=require_all_valid,
-    )
+    """Replay one line-delimited JSON-RPC file without loading it all."""
+    size = file_path.stat().st_size
+    log.event(f"open {file_path} ({size:,} bytes) as a stream")
+    last_np_idx = None
+    if profiler is not None:
+        with file_path.open(encoding="utf-8") as fh:
+            last_np_idx = _last_newpayload_item_index(fh)
+    with file_path.open(encoding="utf-8") as fh:
+        return replay_requests(
+            cfg, secret, session, fh, file_path.name,
+            log, phase=phase, profiler=profiler,
+            require_all_valid=require_all_valid,
+            last_newpayload_idx=last_np_idx,
+        )
 
 
 # ---------------------------------------------------------------------------
