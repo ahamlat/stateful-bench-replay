@@ -469,6 +469,13 @@ on-CPU graphs, or pass `--jfr-all` for CPU + allocation + lock in one JFR.
 - **`overlay.sh: snapshot dir not found: /data/besu` on a schelk box**: the run
   fell back to OverlayFS. Pass `--reset-backend schelk` or set
   `run.reset_backend: schelk`.
+- **`Unknown options: '--Xbal-…'` and Besu exits at once**: the image does not
+  support those flags. Match `besu.extra_args` to the benchmarkoor instance:
+  `--Xplugin-rocksdb-high-spec-enabled=true`,
+  `--Xbal-perfect-parallelization-enabled=true`,
+  `--Xbal-state-root-enabled=true`. Do not pass the older
+  `--Xbal-state-root-timeout` / `--Xbal-processing-timeout` /
+  `--Xbal-optimization-enabled` / `--Xbal-trust-state-root` flags.
 - **Engine API timeout**: every host path in `besu.extra_mounts` must exist;
   otherwise `docker run` silently creates an empty dir and Besu fails with no logs.
   If `/tmp/genesis.json` is missing, the runner copies `genesis.json` from

@@ -133,6 +133,17 @@ class StatefulFixtureInputTests(unittest.TestCase):
                 log.close()
             self.assertEqual(dest.read_text(), '{"config":{}}')
 
+    def test_detects_besu_rejected_options(self):
+        logs = (
+            "[0.056s][warning][aot] Failed to link AdapterHandlerEntry\n"
+            "Unknown options: '--Xbal-state-root-timeout=-1', "
+            "'--Xbal-trust-state-root=false'\n"
+            "\nTo display full help:\n"
+        )
+
+        self.assertIn("--Xbal-state-root-timeout", run._rejected_options(logs))
+        self.assertIsNone(run._rejected_options("Besu is starting\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

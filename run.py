@@ -373,10 +373,10 @@ def _container_running(name: str) -> bool:
     return name in res.stdout.split()
 
 
-def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> None:
+def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> str:
     if not _container_exists(name):
         log.event(f"container {name} no longer exists; cannot dump logs")
-        return
+        return ""
     res = _run(
         DOCKER + ["logs", "--tail", str(tail), name],
         check=False,
@@ -387,6 +387,20 @@ def _dump_container_logs(name: str, log: SweepLog, tail: int = 200) -> None:
     for line in out.splitlines():
         log.event(f"  | {line}")
     log.event("--- end of container logs ---")
+    return out
+
+
+def _rejected_options(container_logs: str) -> str | None:
+    """Return Besu's own 'Unknown options: ...' line, if it printed one.
+
+    Besu exits before its first log line when a flag is not in the image's
+    CLI, so the startup failure otherwise looks like a generic timeout.
+    """
+    for line in container_logs.splitlines():
+        line = line.strip()
+        if line.startswith("Unknown options:"):
+            return line
+    return None
 
 
 def stop_container(name: str) -> None:
@@ -992,7 +1006,14 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
     while time.monotonic() < deadline:
         if not _container_running(cfg.container_name):
             log.event(f"container {cfg.container_name} exited before Engine API came up")
-            _dump_container_logs(cfg.container_name, log)
+            logs = _dump_container_logs(cfg.container_name, log)
+            rejected = _rejected_options(logs)
+            if rejected:
+                raise RuntimeError(
+                    f"Besu image {cfg.image} rejected flags from besu.extra_args: "
+                    f"{rejected} Remove them from the config; this image does not "
+                    "support them."
+                )
             raise RuntimeError(
                 f"Besu container {cfg.container_name} exited during startup; "
                 "see container logs above (also in events.log)"
