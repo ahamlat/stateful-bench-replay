@@ -56,6 +56,8 @@ besu:
   extra_mounts:
     - /tmp/jwtsecret:/tmp/jwtsecret:ro
     - /tmp/genesis.json:/tmp/genesis.json:ro
+  # If /tmp/genesis.json is missing, the runner copies genesis.json from
+  # /data/genesis.json, the snapshot parent, or the artifacts tree.
 
   # Full Besu command line. The runner prepends ONLY --data-path=<container_data_path>;
   # everything else is your call. JWT path / genesis path here must match the

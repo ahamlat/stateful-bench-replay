@@ -857,6 +857,92 @@ _JWT_FALLBACK_SOURCES = (
 )
 
 
+def _genesis_host_path(cfg: Config) -> Path | None:
+    """Host path that extra_mounts binds onto --genesis-file, if any."""
+    genesis_in_container = None
+    for arg in cfg.besu.extra_args:
+        if arg.startswith("--genesis-file="):
+            genesis_in_container = arg.split("=", 1)[1]
+            break
+    if not genesis_in_container:
+        return None
+    for spec in cfg.besu.extra_mounts:
+        parts = spec.split(":")
+        host = parts[0]
+        container = parts[1] if len(parts) > 1 else ""
+        if host and container == genesis_in_container:
+            return Path(host)
+    return None
+
+
+def _genesis_search_roots(cfg: Config) -> list[Path]:
+    roots: list[Path] = []
+    for candidate in (
+        Path("/data/genesis.json"),
+        cfg.besu.data_snapshot_dir.parent / "genesis.json",
+        Path(__file__).resolve().parent / "genesis.json",
+        cfg.input.dir / "genesis.json",
+        cfg.input.dir / "state-actor" / "geth" / "genesis.json",
+        cfg.input.dir / "pre-runs" / "geth" / "genesis.json",
+        cfg.input.dir / "pre-runs" / "geth" / "pre_run_bundle" / "genesis.json",
+        cfg.input.dir / "eest-payloads" / "geth" / "genesis.json",
+    ):
+        if candidate not in roots:
+            roots.append(candidate)
+    return roots
+
+
+def _find_genesis_file(cfg: Config) -> Path | None:
+    for path in _genesis_search_roots(cfg):
+        if path.is_file():
+            return path
+    for subdir in ("state-actor", "pre-runs"):
+        root = cfg.input.dir / subdir
+        if not root.is_dir():
+            continue
+        matches = sorted(root.rglob("genesis.json"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def ensure_genesis_file(cfg: Config, log: SweepLog) -> None:
+    """Copy a found genesis.json onto the extra_mounts host path if missing."""
+    dest = _genesis_host_path(cfg)
+    if dest is None or dest.is_file():
+        return
+    src = _find_genesis_file(cfg)
+    if src is None:
+        searched = ", ".join(str(p) for p in _genesis_search_roots(cfg))
+        raise FileNotFoundError(
+            f"genesis file missing at {dest} and no genesis.json was found. "
+            f"Looked at: {searched}. Copy the jochemnet Besu genesis to "
+            f"{dest} (or next to the snapshot as /data/genesis.json)."
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    log.event(f"genesis missing at {dest}; copied from {src}")
+
+
+def prepare_host_bind_mounts(cfg: Config, log: SweepLog) -> None:
+    """Create JWT/genesis host files, then fail if any extra_mounts path is missing.
+
+    A missing host path makes `docker run -v` silently create a directory.
+    Besu then sees a directory where it expected a file and dies with empty logs.
+    """
+    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
+    ensure_genesis_file(cfg, log)
+    for spec in cfg.besu.extra_mounts:
+        host = spec.split(":", 1)[0]
+        if not host or not Path(host).exists():
+            raise FileNotFoundError(
+                f"besu.extra_mounts host path does not exist: {host!r} "
+                f"(from spec {spec!r}). Create it before running, or fix the "
+                "config: a missing host path makes docker silently create an "
+                "empty directory and Besu will fail to start with no logs."
+            )
+
+
 def ensure_jwt_secret(path: Path, log: SweepLog) -> None:
     """Make sure `path` exists; if not, populate it.
 
@@ -1573,25 +1659,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
         p = cfg.input.dir / name
         if not p.is_file():
             raise FileNotFoundError(f"prelude file missing: {p}")
-    # JWT auto-provisioning: copy from a known fallback (/data/jwt.hex etc.)
-    # or generate a fresh one if nothing is available. /tmp paths in
-    # particular vanish across reboots, so this avoids "jwt secret missing"
-    # being the first thing you see after a host restart.
-    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
-
-    # Validate every host bind-mount source up front: if it doesn't exist
-    # `docker run` silently creates an empty directory there, the container
-    # then sees a directory where it expected a file (e.g. genesis), Besu
-    # fails before log4j and `docker logs` is empty. We've been bitten.
-    for spec in cfg.besu.extra_mounts:
-        host = spec.split(":", 1)[0]
-        if not host or not Path(host).exists():
-            raise FileNotFoundError(
-                f"besu.extra_mounts host path does not exist: {host!r} "
-                f"(from spec {spec!r}). Create it before running, or fix the "
-                "config: a missing host path makes docker silently create an "
-                "empty directory and Besu will fail to start with no logs."
-            )
+    prepare_host_bind_mounts(cfg, log)
 
     # Preflight: passwordless sudo for both helpers we depend on.
     _reset_script = reset_script(cfg)
@@ -1815,14 +1883,7 @@ def _prepare_baseline_overlayfs(
     log.event(f"prepare-baseline start: replay {gas_bump} -> new snapshot {out}")
 
     # Focused preflight (mirrors run_sweep, minus the per-test machinery).
-    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
-    for spec in cfg.besu.extra_mounts:
-        host = spec.split(":", 1)[0]
-        if not host or not Path(host).exists():
-            raise FileNotFoundError(
-                f"besu.extra_mounts host path does not exist: {host!r} "
-                f"(from spec {spec!r})."
-            )
+    prepare_host_bind_mounts(cfg, log)
     _reset_script = reset_script(cfg)
     for probe, hint in (
         (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
@@ -1932,14 +1993,7 @@ def _prepare_baseline_schelk(
               f"scratch -> virgin {cfg.schelk.virgin}")
 
     # Focused preflight (mirrors run_sweep, minus the per-test machinery).
-    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
-    for spec in cfg.besu.extra_mounts:
-        host = spec.split(":", 1)[0]
-        if not host or not Path(host).exists():
-            raise FileNotFoundError(
-                f"besu.extra_mounts host path does not exist: {host!r} "
-                f"(from spec {spec!r})."
-            )
+    prepare_host_bind_mounts(cfg, log)
     _reset_script = reset_script(cfg)
     for probe, hint in (
         (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
@@ -2756,14 +2810,7 @@ def run_compare(
         p = cfg.input.dir / name
         if not p.is_file():
             raise FileNotFoundError(f"prelude file missing: {p}")
-    ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
-    for spec in cfg.besu.extra_mounts:
-        host = spec.split(":", 1)[0]
-        if not host or not Path(host).exists():
-            raise FileNotFoundError(
-                f"besu.extra_mounts host path does not exist: {host!r} "
-                f"(from spec {spec!r})."
-            )
+    prepare_host_bind_mounts(cfg, log)
     _reset_script = reset_script(cfg)
     for probe, hint in (
         (DOCKER + ["version", "--format", "{{.Server.Version}}"], "sudo -n docker version"),
