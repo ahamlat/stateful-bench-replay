@@ -1769,6 +1769,17 @@ def run_prepare_baseline(cfg: Config, baseline_out: Path | None) -> int:
     if not src.is_file():
         print(f"error: gas-bump file not found: {src} "
               "(set input.gas_bump_file to the right name).", file=sys.stderr)
+        nearby = sorted(src.parent.glob("*.request")) if src.parent.is_dir() else []
+        if not nearby and src.parent.parent.is_dir():
+            nearby = sorted(src.parent.parent.glob("*.request"))
+        if nearby:
+            print("  nearby *.request files:", file=sys.stderr)
+            for path in nearby:
+                try:
+                    rel = path.relative_to(cfg.input.dir)
+                except ValueError:
+                    rel = path
+                print(f"    {rel}", file=sys.stderr)
         return 2
 
     if cfg.run.reset_backend == "schelk":
