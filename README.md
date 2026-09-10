@@ -132,8 +132,8 @@ Set the input paths to the extracted benchmarkoor artifacts:
 input:
   dir: /home/ahamlat/benchmarkoor-build-artifacts
   prelude:
-    - pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
-  gas_bump_file: pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+    - pre-runs/geth/pre_run_bundle/pre-run.request
+  gas_bump_file: pre-runs/geth/pre_run_bundle/pre-run.request
 tests:
   format: stateful_engine
   fixtures_subdir: eest-payloads/geth/blockchain_tests_stateful_engine
@@ -141,8 +141,9 @@ tests:
   order: alphabetical
 ```
 
-Use the exact `pre-run.request` path from the suite artifacts. The runner
-replays this line-delimited file during baseline preparation:
+The suite UI shows the step as `pre_run/pre-run.request`. On disk the file is
+`pre-runs/geth/pre_run_bundle/pre-run.request`. The runner replays this
+line-delimited file during baseline preparation:
 
 ```bash
 # Start from the pristine jochemnet snapshot and add all pre-run requests.

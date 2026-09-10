@@ -97,16 +97,16 @@ input:
   # tests.fixtures_subdir are relative to this directory.
   dir: /home/ahamlat/benchmarkoor-build-artifacts
 
-  # Pre-run request file from
-  # pre-runs/geth/pre_run_bundle. Replay it once with
-  # `--prepare-baseline`, then use `--skip-gas-bump` so each test
-  # starts from that baked snapshot.
+  # Pre-run request file from pre-runs/geth/pre_run_bundle.
+  # The suite UI shows this as pre_run/pre-run.request; on disk the
+  # file is pre-run.request in the bundle directory. Replay it once
+  # with `--prepare-baseline`, then use `--skip-gas-bump`.
   prelude:
-    - pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+    - pre-runs/geth/pre_run_bundle/pre-run.request
 
   # Same file as above. `--skip-gas-bump` / `--persist-prelude`
   # drop this entry from the per-test prelude.
-  gas_bump_file: pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+  gas_bump_file: pre-runs/geth/pre_run_bundle/pre-run.request
 
 tests:
   format: stateful_engine
