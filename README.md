@@ -130,7 +130,7 @@ Set the input paths to the extracted benchmarkoor artifacts:
 
 ```yaml
 input:
-  dir: /data/benchmarkoor-build-artifacts
+  dir: /home/ahamlat/benchmarkoor-build-artifacts
   prelude:
     - pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
   gas_bump_file: pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
