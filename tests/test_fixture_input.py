@@ -108,6 +108,31 @@ class StatefulFixtureInputTests(unittest.TestCase):
 
             self.assertFalse(ok)
 
+    def test_copies_missing_genesis_from_snapshot_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = root / "besu"
+            snapshot.mkdir()
+            src = root / "genesis.json"
+            src.write_text('{"config":{}}')
+            dest = root / "tmp" / "genesis.json"
+            log = run.SweepLog(root / "logs")
+            cfg = SimpleNamespace(
+                input=SimpleNamespace(dir=root / "artifacts"),
+                besu=SimpleNamespace(
+                    data_snapshot_dir=snapshot,
+                    jwt_secret_path=root / "jwt",
+                    extra_args=["--genesis-file=/tmp/genesis.json"],
+                    extra_mounts=[f"{dest}:/tmp/genesis.json:ro"],
+                ),
+            )
+            (root / "artifacts").mkdir()
+            try:
+                run.ensure_genesis_file(cfg, log)
+            finally:
+                log.close()
+            self.assertEqual(dest.read_text(), '{"config":{}}')
+
 
 if __name__ == "__main__":
     unittest.main()

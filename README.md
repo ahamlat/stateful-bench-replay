@@ -471,5 +471,8 @@ on-CPU graphs, or pass `--jfr-all` for CPU + allocation + lock in one JFR.
   `run.reset_backend: schelk`.
 - **Engine API timeout**: every host path in `besu.extra_mounts` must exist;
   otherwise `docker run` silently creates an empty dir and Besu fails with no logs.
+  If `/tmp/genesis.json` is missing, the runner copies `genesis.json` from
+  `/data/genesis.json` or the artifacts tree. Put the jochemnet Besu genesis at
+  `/data/genesis.json` if the copy step cannot find it.
 - **JWT secret missing** is auto-handled: the runner copies from `/data/jwt.hex`
   or `~/.besu/jwt.hex`, else generates a fresh 32-byte hex secret in place.
