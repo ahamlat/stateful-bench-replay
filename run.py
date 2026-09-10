@@ -31,6 +31,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import fnmatch
+import functools
 import json
 import os
 import random
@@ -81,6 +82,8 @@ class InputConfig:
 class TestsConfig:
     setup_subdir: str
     testing_subdir: str
+    format: str
+    fixtures_subdir: str
     filter: str
     order: str
 
@@ -185,6 +188,8 @@ def load_config(path: Path) -> Config:
         tests=TestsConfig(
             setup_subdir=t.get("setup_subdir", "setup"),
             testing_subdir=t.get("testing_subdir", "testing"),
+            format=str(t.get("format", "auto")),
+            fixtures_subdir=str(t.get("fixtures_subdir", ".")),
             filter=str(t.get("filter", "*")),
             order=str(t.get("order", "alphabetical")),
         ),
@@ -1035,49 +1040,48 @@ def post_engine_line(
     return resp.status_code, body, None
 
 
-def _scan_lines(file_path: Path) -> list[tuple[int, str, str]]:
-    """Return [(line_no, method, raw_line)] for non-empty, json-decodable
-    lines. Bad lines are surfaced later through the normal failure path; we
-    only use this scan to find the index of the last newPayload."""
+def _scan_requests(raw_lines: list[str]) -> list[tuple[int, str, str]]:
+    """Return decoded request metadata for non-empty JSON-RPC lines."""
     out: list[tuple[int, str, str]] = []
-    with file_path.open("r") as fh:
-        for line_no, raw in enumerate(fh, start=1):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                method = json.loads(raw).get("method", "?")
-            except json.JSONDecodeError:
-                method = ""
-            out.append((line_no, method, raw))
+    for line_no, raw in enumerate(raw_lines, start=1):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            method = json.loads(raw).get("method", "?")
+        except json.JSONDecodeError:
+            method = ""
+        out.append((line_no, method, raw))
     return out
 
 
-def replay_file(
+def replay_requests(
     cfg: Config,
     secret: bytes,
     session: requests.Session,
-    file_path: Path,
+    raw_lines: list[str],
+    label: str,
     log: SweepLog,
     phase: str | None = None,
     profiler: ProfilerSession | None = None,
+    require_all_valid: bool = False,
 ) -> bool:
-    """Replay one .txt file line-by-line. Returns False iff fail_fast tripped.
+    """Replay JSON-RPC requests in order.
 
     `phase` is an optional human label ("setup", "testing", ...) prepended to
-    the event log so that paired files (setup/<name>.txt and testing/<name>.txt
-    sharing the same basename) can be told apart at a glance.
+    the event log.
+
+    By default, failures only return False when fail-fast stops replay.
+    `require_all_valid` returns False after any failed request.
 
     If `profiler` is given, async-profiler is started just before the file's
     LAST newPayload call and stopped after the LAST line of the file has been
-    processed. That brackets exactly the heavy block (and its trailing FCU)
-    in setup/, and the single measured block in testing/.
+    processed.
     """
-    label = file_path.name
     prefix = f"replay [{phase}] " if phase else "replay "
     log.event(f"{prefix}{label}")
 
-    items = _scan_lines(file_path)
+    items = _scan_requests(raw_lines)
 
     # Index of the LAST engine_newPayload* line, or -1 if none.
     last_np_idx = -1
@@ -1086,8 +1090,10 @@ def replay_file(
             last_np_idx = i
 
     profile_active = False
+    all_valid = True
     for i, (line_no, method, raw) in enumerate(items):
         if not method:
+            all_valid = False
             log.record_fail(label, line_no, "bad_json", {})
             if cfg.run.fail_fast:
                 return False
@@ -1099,6 +1105,7 @@ def replay_file(
 
         status, body, err = post_engine_line(cfg, secret, session, raw)
         if err is not None and body is None:
+            all_valid = False
             log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
             if cfg.run.fail_fast:
                 if profile_active:
@@ -1106,6 +1113,7 @@ def replay_file(
                 return False
             continue
         if status != 200:
+            all_valid = False
             log.record_fail(label, line_no, "http_status",
                             {"method": method, "status": status,
                              "body": json.dumps(body) if body is not None else err})
@@ -1119,6 +1127,7 @@ def replay_file(
         if ok:
             log.record_ok(label)
         else:
+            all_valid = False
             log.record_fail(label, line_no, kind, {"method": method, **detail})
             if cfg.run.fail_fast:
                 if profile_active:
@@ -1127,12 +1136,182 @@ def replay_file(
 
     if profile_active:
         profiler.stop()
-    return True
+    return all_valid if require_all_valid else True
+
+
+def replay_file(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    file_path: Path,
+    log: SweepLog,
+    phase: str | None = None,
+    profiler: ProfilerSession | None = None,
+    require_all_valid: bool = False,
+) -> bool:
+    """Replay one line-delimited JSON-RPC file."""
+    return replay_requests(
+        cfg, secret, session, file_path.read_text().splitlines(), file_path.name,
+        log, phase=phase, profiler=profiler, require_all_valid=require_all_valid,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Test discovery
 # ---------------------------------------------------------------------------
+
+FIXTURE_FORMATS = ("auto", "legacy", "stateful_engine")
+ZERO_HASH = "0x" + "00" * 32
+
+
+def _test_format(cfg: Config) -> str:
+    value = cfg.tests.format.lower()
+    if value not in FIXTURE_FORMATS:
+        raise ValueError(
+            f"tests.format must be one of {FIXTURE_FORMATS}, got {value!r}"
+        )
+    if value != "auto":
+        return value
+    setup_dir = cfg.input.dir / cfg.tests.setup_subdir
+    testing_dir = cfg.input.dir / cfg.tests.testing_subdir
+    if setup_dir.is_dir() and testing_dir.is_dir():
+        return "legacy"
+    return "stateful_engine"
+
+
+def _fixture_root(cfg: Config) -> Path:
+    return cfg.input.dir / cfg.tests.fixtures_subdir
+
+
+def _read_fixture_cases(path: Path) -> list[tuple[str, dict]]:
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid fixture JSON {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        return []
+    return [
+        (name, fixture)
+        for name, fixture in data.items()
+        if isinstance(name, str)
+        and isinstance(fixture, dict)
+        and "setupEngineNewPayloads" in fixture
+        and "engineNewPayloads" in fixture
+    ]
+
+
+@functools.lru_cache(maxsize=8)
+def _stateful_fixture_index_for_root(root_text: str) -> dict[str, tuple[Path, str]]:
+    root = Path(root_text)
+    if not root.is_dir():
+        raise FileNotFoundError(f"stateful fixture dir missing: {root}")
+
+    found: list[tuple[str, Path]] = []
+    for path in sorted(root.rglob("*.json")):
+        for name, _fixture in _read_fixture_cases(path):
+            found.append((name, path))
+
+    counts: dict[str, int] = {}
+    for name, _path in found:
+        counts[name] = counts.get(name, 0) + 1
+
+    index: dict[str, tuple[Path, str]] = {}
+    for name, path in found:
+        display = name
+        if counts[name] > 1:
+            display = f"{path.relative_to(root).as_posix()}::{name}"
+        index[display] = (path, name)
+    return index
+
+
+def _stateful_fixture_index(cfg: Config) -> dict[str, tuple[Path, str]]:
+    """Map display names to their JSON file and dictionary key."""
+    return _stateful_fixture_index_for_root(str(_fixture_root(cfg).resolve()))
+
+
+def _rpc_version(value, field: str, source: str) -> int:
+    try:
+        version = int(str(value), 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source}: invalid {field}: {value!r}") from exc
+    if version < 1:
+        raise ValueError(f"{source}: invalid {field}: {value!r}")
+    return version
+
+
+def _fixture_payload_requests(payloads, source: str) -> list[str]:
+    if not isinstance(payloads, list):
+        raise ValueError(f"{source}: payload field must be a list")
+
+    lines: list[str] = []
+    for idx, entry in enumerate(payloads, start=1):
+        item_source = f"{source} payload {idx}"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{item_source}: payload must be an object")
+        params = entry.get("params")
+        if not isinstance(params, list) or not params or not isinstance(params[0], dict):
+            raise ValueError(f"{item_source}: params[0] execution payload is missing")
+
+        np_version = _rpc_version(
+            entry.get("newPayloadVersion"), "newPayloadVersion", item_source
+        )
+        fcu_value = entry.get(
+            "forkchoiceUpdatedVersion", entry.get("forkchoiceVersion")
+        )
+        if fcu_value is None:
+            fcu_value = 3 if np_version >= 3 else np_version
+        fcu_version = _rpc_version(
+            fcu_value, "forkchoiceUpdatedVersion", item_source
+        )
+
+        block_hash = params[0].get("blockHash")
+        if not isinstance(block_hash, str) or not block_hash.startswith("0x"):
+            raise ValueError(f"{item_source}: params[0].blockHash is missing")
+
+        new_payload = {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "method": f"engine_newPayloadV{np_version}",
+            "params": params,
+        }
+        forkchoice = {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "method": f"engine_forkchoiceUpdatedV{fcu_version}",
+            "params": [{
+                "headBlockHash": block_hash,
+                "safeBlockHash": ZERO_HASH,
+                "finalizedBlockHash": ZERO_HASH,
+            }, None],
+        }
+        lines.extend((
+            json.dumps(new_payload, separators=(",", ":")),
+            json.dumps(forkchoice, separators=(",", ":")),
+        ))
+    return lines
+
+
+def _stateful_test_requests(
+    cfg: Config, name: str
+) -> tuple[list[str], list[str], str]:
+    index = _stateful_fixture_index(cfg)
+    try:
+        path, case_name = index[name]
+    except KeyError as exc:
+        raise KeyError(f"unknown stateful fixture test: {name}") from exc
+    cases = dict(_read_fixture_cases(path))
+    fixture = cases[case_name]
+    source = f"{path.name}::{case_name}"
+    setup = _fixture_payload_requests(
+        fixture["setupEngineNewPayloads"], f"{source} setupEngineNewPayloads"
+    )
+    testing = _fixture_payload_requests(
+        fixture["engineNewPayloads"], f"{source} engineNewPayloads"
+    )
+    if not testing:
+        raise ValueError(f"{source}: engineNewPayloads is empty")
+    return setup, testing, source
+
 
 def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
                    explicit: list[str] | None = None) -> list[str]:
@@ -1144,6 +1323,41 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
     setup/testing pairs. `limit` still applies last.
     """
     pattern = filter_override or cfg.tests.filter
+    if _test_format(cfg) == "stateful_engine":
+        available = _stateful_fixture_index(cfg)
+        names = list(available)
+        if explicit is not None:
+            seen: set[str] = set()
+            selected = []
+            missing = []
+            for name in explicit:
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name in available:
+                    selected.append(name)
+                else:
+                    missing.append(name)
+            if missing:
+                preview = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+                print(
+                    f"warn: {len(missing)} requested fixture test(s) were not found: "
+                    f"{preview}", file=sys.stderr,
+                )
+        else:
+            selected = [name for name in names if fnmatch.fnmatch(name, pattern)]
+            if cfg.tests.order == "alphabetical":
+                selected.sort()
+            elif cfg.tests.order == "as_listed":
+                pass
+            elif cfg.tests.order == "shuffled":
+                random.shuffle(selected)
+            else:
+                raise ValueError(f"unknown tests.order: {cfg.tests.order}")
+        if limit is not None and limit >= 0:
+            selected = selected[:limit]
+        return selected
+
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
     if not setup_dir.is_dir():
@@ -1210,12 +1424,32 @@ def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
                    *,
                    setup_profiler: ProfilerSession | None = None,
                    testing_profiler: ProfilerSession | None = None) -> bool:
-    if not replay_file(cfg, secret, session, setup_dir / name, log,
-                       phase="setup", profiler=setup_profiler):
+    if _test_format(cfg) == "stateful_engine":
+        setup_lines, testing_lines, source = _stateful_test_requests(cfg, name)
+        setup_ok = replay_requests(
+            cfg, secret, session, setup_lines, source, log,
+            phase="setup", profiler=setup_profiler,
+        )
+    else:
+        setup_ok = replay_file(
+            cfg, secret, session, setup_dir / name, log,
+            phase="setup", profiler=setup_profiler,
+        )
+    if not setup_ok:
         log.event(f"fail-fast tripped during setup of {name}")
         return False
-    if not replay_file(cfg, secret, session, testing_dir / name, log,
-                       phase="testing", profiler=testing_profiler):
+
+    if _test_format(cfg) == "stateful_engine":
+        testing_ok = replay_requests(
+            cfg, secret, session, testing_lines, source, log,
+            phase="testing", profiler=testing_profiler,
+        )
+    else:
+        testing_ok = replay_file(
+            cfg, secret, session, testing_dir / name, log,
+            phase="testing", profiler=testing_profiler,
+        )
+    if not testing_ok:
         log.event(f"fail-fast tripped during testing of {name}")
         return False
     return True
@@ -1601,7 +1835,10 @@ def _prepare_baseline_overlayfs(
             started = True
             wait_for_engine(cfg.besu, secret, log)
             log_chain_head(cfg.besu, log, "head BEFORE gas-bump")
-            ok = replay_file(cfg, secret, session, src, log, phase="prepare")
+            ok = replay_file(
+                cfg, secret, session, src, log, phase="prepare",
+                require_all_valid=True,
+            )
             if ok:
                 log_chain_head(cfg.besu, log, "head AFTER gas-bump")
             save_container_logs(
@@ -1715,7 +1952,10 @@ def _prepare_baseline_schelk(
             started = True
             wait_for_engine(cfg.besu, secret, log)
             log_chain_head(cfg.besu, log, "head BEFORE gas-bump")
-            ok = replay_file(cfg, secret, session, src, log, phase="prepare")
+            ok = replay_file(
+                cfg, secret, session, src, log, phase="prepare",
+                require_all_valid=True,
+            )
             if ok:
                 log_chain_head(cfg.besu, log, "head AFTER gas-bump")
             save_container_logs(
@@ -1780,7 +2020,7 @@ def _bumped_snapshot_dir(cfg: Config) -> Path:
 # per-test testing-block times and emit an HTML report.
 #
 # This whole section is additive: it reuses the existing helpers (start_besu,
-# reset_to_baseline, wait_for_engine, post_engine_line, _classify, _scan_lines,
+# reset_to_baseline, wait_for_engine, post_engine_line, _classify, request scan,
 # discover_tests, SweepLog, ...) without modifying any of them, so the default
 # single-image sweep keeps behaving exactly as before.
 # ===========================================================================
@@ -1871,21 +2111,20 @@ def _parse_last_imported(log_path: Path) -> dict | None:
     return last
 
 
-def _replay_file_measure(
+def _replay_requests_measure(
     cfg: Config,
     secret: bytes,
     session: requests.Session,
-    file_path: Path,
+    raw_lines: list[str],
+    label: str,
     log: SweepLog,
     *,
     source_label: str,
     phase: str | None = None,
 ) -> tuple[bool, dict]:
-    """Timed sibling of `replay_file`, used only by compare mode.
+    """Replay and time a sequence of JSON-RPC requests for compare mode.
 
-    Re-uses `_scan_lines`, `post_engine_line` and `_classify` unchanged. On
-    top of the normal ok/fail bookkeeping it times every Engine-API call and
-    returns the per-call latencies in milliseconds:
+    It times each Engine API call and returns per-call latency in milliseconds:
 
         {"newpayload_ms": [...], "fcu_ms": [...],
          "last_newpayload_ms": float | None, "total_newpayload_ms": float}
@@ -1894,15 +2133,12 @@ def _replay_file_measure(
     testing/<name>.txt file it is the single measured heavy block, which is
     exactly what we want to compare between two Besu versions.
 
-    `source_label` is the bucket name used for SweepLog counters; in compare
-    mode we prefix it with the version label so each version keeps its own
-    ok/fail tallies in summary.json.
+    `source_label` is the bucket name used for SweepLog counters.
     """
-    label = file_path.name
     prefix = f"replay [{phase}] " if phase else "replay "
     log.event(f"{prefix}{label}")
 
-    items = _scan_lines(file_path)
+    items = _scan_requests(raw_lines)
     np_ms: list[float] = []
     fcu_ms: list[float] = []
     ok_all = True
@@ -1956,6 +2192,23 @@ def _replay_file_measure(
         "last_newpayload_ms": (np_ms[-1] if np_ms else None),
         "total_newpayload_ms": (sum(np_ms) if np_ms else 0.0),
     }
+
+
+def _replay_file_measure(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    file_path: Path,
+    log: SweepLog,
+    *,
+    source_label: str,
+    phase: str | None = None,
+) -> tuple[bool, dict]:
+    """Replay and time one line-delimited JSON-RPC file."""
+    return _replay_requests_measure(
+        cfg, secret, session, file_path.read_text().splitlines(), file_path.name,
+        log, source_label=source_label, phase=phase,
+    )
 
 
 def _run_version(
@@ -2014,18 +2267,35 @@ def _run_version(
                 testing_metrics: dict | None = None
                 if test_ok or not cfg.run.fail_fast:
                     # Setup phase (state prep) — replayed, not part of the number.
-                    s_ok, _ = _replay_file_measure(
-                        cfg, secret, session, setup_dir / name, log,
-                        source_label=f"[{label}] setup/{name}", phase="setup",
-                    )
+                    if _test_format(cfg) == "stateful_engine":
+                        setup_lines, testing_lines, source = _stateful_test_requests(
+                            cfg, name
+                        )
+                        s_ok, _ = _replay_requests_measure(
+                            cfg, secret, session, setup_lines, source, log,
+                            source_label=f"[{label}] setup/{name}", phase="setup",
+                        )
+                    else:
+                        s_ok, _ = _replay_file_measure(
+                            cfg, secret, session, setup_dir / name, log,
+                            source_label=f"[{label}] setup/{name}", phase="setup",
+                        )
                     if not s_ok:
                         test_ok = False
                     # Testing phase — this is the measured block.
                     if s_ok or not cfg.run.fail_fast:
-                        t_ok, testing_metrics = _replay_file_measure(
-                            cfg, secret, session, testing_dir / name, log,
-                            source_label=f"[{label}] testing/{name}", phase="testing",
-                        )
+                        if _test_format(cfg) == "stateful_engine":
+                            t_ok, testing_metrics = _replay_requests_measure(
+                                cfg, secret, session, testing_lines, source, log,
+                                source_label=f"[{label}] testing/{name}",
+                                phase="testing",
+                            )
+                        else:
+                            t_ok, testing_metrics = _replay_file_measure(
+                                cfg, secret, session, testing_dir / name, log,
+                                source_label=f"[{label}] testing/{name}",
+                                phase="testing",
+                            )
                         if not t_ok:
                             test_ok = False
 
@@ -2777,8 +3047,11 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.run.skip_gas_bump or cfg.run.persist_prelude:
         mode = "skip-gas-bump" if cfg.run.skip_gas_bump else "persist-prelude"
         before = list(cfg.input.prelude)
-        cfg.input.prelude = [f for f in before
-                             if Path(f).name != cfg.input.gas_bump_file]
+        configured = Path(cfg.input.gas_bump_file)
+        cfg.input.prelude = [
+            f for f in before
+            if Path(f) != configured and Path(f).name != configured.name
+        ]
         removed = [f for f in before if f not in cfg.input.prelude]
         if removed:
             if cfg.run.persist_prelude:

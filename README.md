@@ -120,6 +120,48 @@ $EDITOR config.yaml          # set besu.image, input.dir, JWT + genesis paths
 ./runBenchmark.sh                                    # full sweep
 ```
 
+### New benchmarkoor stateful fixtures
+
+The runner also reads the nested `blockchain_tests_stateful_engine` format.
+It reads each `.json` file recursively. Each top-level dictionary entry becomes
+one selectable test.
+
+Set the input paths to the extracted benchmarkoor artifacts:
+
+```yaml
+input:
+  dir: /data/benchmarkoor-build-artifacts
+  prelude:
+    - pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+  gas_bump_file: pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+tests:
+  format: stateful_engine
+  fixtures_subdir: eest-payloads/geth/blockchain_tests_stateful_engine
+  filter: "*"
+  order: alphabetical
+```
+
+Use the exact `pre-run.request` path from the suite artifacts. The runner
+replays this line-delimited file during baseline preparation:
+
+```bash
+# Start from the pristine jochemnet snapshot and add all pre-run requests.
+./runBenchmark.sh --prepare-baseline
+
+# Discover tests in all for_amsterdam_at_* directories.
+./runBenchmark.sh --skip-gas-bump --dry-run
+
+# Run one test from the prepared snapshot.
+./runBenchmark.sh --skip-gas-bump --filter '*sload*' --limit 1
+```
+
+For each selected test, the runner reads `setupEngineNewPayloads` first. It
+then reads `engineNewPayloads` as the measured phase. For each fixture payload,
+it sends `engine_newPayloadV*` and then `engine_forkchoiceUpdatedV*`.
+
+The old `setup/` and `testing/` input format still works. The default
+`tests.format: auto` selects it when both old directories exist.
+
 ---
 
 ## Testing with schelk
