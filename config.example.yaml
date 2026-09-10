@@ -63,7 +63,10 @@ besu:
   # everything else is your call. JWT path / genesis path here must match the
   # in-container paths from extra_mounts above.
   extra_args:
+    # Same flags as the benchmarkoor Besu instance, minus --data-path
+    # (the runner adds --data-path=<container_data_path>).
     - --data-storage-format=BONSAI
+    - --genesis-state-hash-cache-enabled=true
     - --p2p-enabled=false
     - --sync-mode=FULL
     - --max-peers=0
@@ -83,11 +86,9 @@ besu:
     - --metrics-host=0.0.0.0
     - --metrics-port=8008
     - --genesis-file=/tmp/genesis.json
-    - --Xbal-state-root-timeout=-1
-    - --Xbal-processing-timeout=-1
-    - --Xbal-optimization-enabled=false
-    - --Xbal-perfect-parallelization-enabled=false
-    - --Xbal-trust-state-root=false
+    - --Xplugin-rocksdb-high-spec-enabled=true
+    - --Xbal-perfect-parallelization-enabled=true
+    - --Xbal-state-root-enabled=true
 
   # Seconds to wait for the Engine API to become responsive after `docker run`.
   # In `restart` isolation mode this timeout is also used per test, so set it
