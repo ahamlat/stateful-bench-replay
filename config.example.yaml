@@ -93,7 +93,16 @@ besu:
   startup_timeout_s: 120
 
 input:
-  # Directory containing funding.txt, gas-bump.txt, setup/, testing/.
+  # Legacy input: directory containing funding.txt, gas-bump.txt, setup/,
+  # and testing/.
+  #
+  # Stateful-engine input: set this to the benchmarkoor-build-artifacts root.
+  # Then use paths such as:
+  #   prelude:
+  #     - pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+  #   gas_bump_file: pre-runs/geth/pre_run_bundle/pre_run/pre-run.request
+  # The pre-run request file replaces the old gas-bump file. Run
+  # `--prepare-baseline`, stop Besu, and then use `--skip-gas-bump`.
   dir: /home/ahamlat/reproduce-8038
 
   # Files replayed before any test, IN ORDER. The chain is built bottom-up:
@@ -112,6 +121,16 @@ input:
   gas_bump_file: gas-bump.txt
 
 tests:
+  # auto uses the old setup/testing pair when both directories exist.
+  # Otherwise, it reads nested stateful-engine JSON fixtures.
+  # Set an explicit value to prevent incorrect detection.
+  # format: auto                 # auto | legacy | stateful_engine
+
+  # For stateful_engine, this path is relative to input.dir. The runner scans
+  # all nested .json files. Each top-level dictionary entry is one test.
+  # fixtures_subdir: eest-payloads/geth/blockchain_tests_stateful_engine
+
+  # These directories are used only by the legacy format.
   setup_subdir: setup
   testing_subdir: testing
 
