@@ -1,6 +1,8 @@
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,6 +134,32 @@ class StatefulFixtureInputTests(unittest.TestCase):
             finally:
                 log.close()
             self.assertEqual(dest.read_text(), '{"config":{}}')
+
+    def test_baseline_out_dir_falls_back_to_sudo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "data" / "besu-bumped"
+            log = run.SweepLog(root / "logs")
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, check=True, capture=False):
+                calls.append(cmd)
+                os.makedirs(out, exist_ok=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            original = run._run
+            run._run = fake_run
+            try:
+                with unittest.mock.patch.object(
+                    Path, "mkdir", side_effect=PermissionError
+                ):
+                    run.ensure_baseline_out_dir(out, log)
+            finally:
+                run._run = original
+                log.close()
+
+            self.assertTrue(out.is_dir())
+            self.assertEqual(calls, [["sudo", "-n", "mkdir", "-p", str(out)]])
 
     def test_rpc_method_reads_prefix_only(self):
         huge = '{"jsonrpc":"2.0","method":"engine_newPayloadV5","params":["' + ("x" * 10000) + '"]}'

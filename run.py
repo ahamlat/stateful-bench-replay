@@ -907,6 +907,32 @@ def _genesis_search_roots(cfg: Config) -> list[Path]:
     return roots
 
 
+def ensure_baseline_out_dir(out: Path, log: SweepLog) -> None:
+    """Create the pre-bumped snapshot dir, with sudo when the parent is root-owned.
+
+    /data is usually root-owned, so a plain mkdir raises PermissionError. The
+    rsync that fills this dir already runs under sudo, so create it the same
+    way. Called during preflight: a permission problem must surface before
+    the replay, not after it.
+    """
+    if out.is_dir():
+        return
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        return
+    except PermissionError:
+        pass
+    res = _run(["sudo", "-n", "mkdir", "-p", str(out)], check=False, capture=True)
+    if res.returncode != 0 or not out.is_dir():
+        raise PermissionError(
+            f"cannot create the pre-bumped snapshot dir {out}: no write access "
+            f"and `sudo -n mkdir -p {out}` failed ({(res.stderr or '').strip()}). "
+            f"Create it once with `sudo mkdir -p {out}`, or add mkdir + rsync "
+            "to the NOPASSWD sudoers entry."
+        )
+    log.event(f"created pre-bumped snapshot dir {out} with sudo")
+
+
 def _find_genesis_file(cfg: Config) -> Path | None:
     for path in _genesis_search_roots(cfg):
         if path.is_file():
@@ -1959,6 +1985,8 @@ def _prepare_baseline_overlayfs(
             raise RuntimeError(
                 f"`{hint}` failed with exit {e.returncode}: {(e.stderr or '').strip()}"
             ) from None
+    # The replay takes tens of minutes; check the destination first.
+    ensure_baseline_out_dir(out, log)
 
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
     merged = cfg.besu.overlay_dir / "test" / "merged"
@@ -1988,7 +2016,7 @@ def _prepare_baseline_overlayfs(
             if not ok:
                 log.event("prepare-baseline: gas-bump replay failed; snapshot NOT written")
             else:
-                out.mkdir(parents=True, exist_ok=True)
+                ensure_baseline_out_dir(out, log)
                 # Trailing slash copies the CONTENTS of merged to the root of
                 # out, so out/database, out/caches, ... mirror the snapshot
                 # layout. sudo: the datadir is root-owned. --delete keeps a
