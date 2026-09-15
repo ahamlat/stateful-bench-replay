@@ -476,6 +476,14 @@ on-CPU graphs, or pass `--jfr-all` for CPU + allocation + lock in one JFR.
   `--Xbal-state-root-enabled=true`. Do not pass the older
   `--Xbal-state-root-timeout` / `--Xbal-processing-timeout` /
   `--Xbal-optimization-enabled` / `--Xbal-trust-state-root` flags.
+- **`Method not enabled` on `engine_newPayloadV5`**: the genesis file does not
+  activate the fork the payloads need. The Besu start banner prints the fork
+  list; it must show Osaka and Amsterdam after Prague. Add `osakaTime` and
+  `amsterdamTime` to `config` in the genesis file, then run again.
+- **`PermissionError: '/data/besu-bumped'` in `--prepare-baseline`**: `/data` is
+  root-owned. The runner now creates the dir with `sudo -n mkdir -p`. If sudo
+  has no `mkdir` rights, create it once: `sudo mkdir -p /data/besu-bumped`.
+  The rsync that fills it also needs sudo rights.
 - **Engine API timeout**: every host path in `besu.extra_mounts` must exist;
   otherwise `docker run` silently creates an empty dir and Besu fails with no logs.
   If `/tmp/genesis.json` is missing, the runner copies `genesis.json` from
