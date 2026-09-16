@@ -149,7 +149,9 @@ line-delimited file during baseline preparation:
 # Start from the pristine jochemnet snapshot and add all pre-run requests.
 ./runBenchmark.sh --prepare-baseline
 
-# Discover tests in all for_amsterdam_at_* directories.
+# Discover tests in all for_amsterdam_at_* directories. The runner keeps
+# only fixtures whose first parent hash is the head after the pre-run
+# (genesis-style cases are skipped).
 ./runBenchmark.sh --skip-gas-bump --dry-run
 
 # Run one test from the prepared snapshot.
@@ -476,6 +478,10 @@ on-CPU graphs, or pass `--jfr-all` for CPU + allocation + lock in one JFR.
   `--Xbal-state-root-enabled=true`. Do not pass the older
   `--Xbal-state-root-timeout` / `--Xbal-processing-timeout` /
   `--Xbal-optimization-enabled` / `--Xbal-trust-state-root` flags.
+- **`status=SYNCING` and `head AFTER replay` does not move**: the payload's
+  parent block is not on the chain, so Besu starts a backward sync and imports
+  nothing. With `tests.match_chain_head: true` (the default) the runner drops
+  those fixtures before replay. Pass `--no-match-chain-head` to keep them.
 - **`Method not enabled` on `engine_newPayloadV5`**: the genesis file does not
   activate the fork the payloads need. The Besu start banner prints the fork
   list; it must show Osaka and Amsterdam after Prague. Add `osakaTime` and

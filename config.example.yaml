@@ -127,6 +127,11 @@ tests:
   #   "test_account_query.py__*"            -> all account_query tests
   filter: "*"
 
+  # Drop fixtures whose first setup payload does not chain onto the head
+  # after the pre-run (the baked snapshot when --skip-gas-bump is set).
+  # This skips genesis-style cases mixed into eest-payloads.
+  match_chain_head: true
+
   # alphabetical | as_listed | shuffled
   order: alphabetical
 

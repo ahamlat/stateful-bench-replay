@@ -19,13 +19,14 @@ def config(root: Path, *, fixture_format: str = "stateful_engine"):
             testing_subdir="testing",
             filter="*",
             order="alphabetical",
+            match_chain_head=True,
         ),
     )
 
 
-def payload(block_hash: str, *, np_version="5", fcu_version="3"):
+def payload(block_hash: str, *, np_version="5", fcu_version="3", parent=None):
     return {
-        "params": [{"blockHash": block_hash, "parentHash": run.ZERO_HASH}],
+        "params": [{"blockHash": block_hash, "parentHash": parent or run.ZERO_HASH}],
         "newPayloadVersion": np_version,
         "forkchoiceUpdatedVersion": fcu_version,
     }
@@ -87,6 +88,40 @@ class StatefulFixtureInputTests(unittest.TestCase):
             self.assertIn("sload.json::sload-test", source)
             self.assertEqual(json.loads(testing[0])["params"][0]["blockHash"], test_hash)
 
+    def test_filters_fixtures_to_pre_run_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            head = "0x" + "aa" * 32
+            other = "0x" + "bb" * 32
+            d1 = root / "fixtures" / "for_amsterdam_at_0100M" / "stateful"
+            d2 = root / "fixtures" / "for_amsterdam_at_0120M" / "stateful"
+            d1.mkdir(parents=True)
+            d2.mkdir(parents=True)
+            (d1 / "sstore.json").write_text(json.dumps({
+                "sstore-jochemnet": {
+                    "setupEngineNewPayloads": [payload("0x" + "11" * 32, parent=head)],
+                    "engineNewPayloads": [payload("0x" + "22" * 32)],
+                }
+            }))
+            (d2 / "sstore.json").write_text(json.dumps({
+                "sstore-genesis": {
+                    "setupEngineNewPayloads": [payload("0x" + "33" * 32, parent=other)],
+                    "engineNewPayloads": [payload("0x" + "44" * 32)],
+                }
+            }))
+            cfg = config(root)
+            names = run.discover_tests(cfg, "*sstore*", None)
+            log = run.SweepLog(root / "logs")
+            try:
+                kept = run.filter_stateful_tests_for_head(cfg, names, head, log)
+                limited = run._apply_limit(kept, 1)
+            finally:
+                log.close()
+
+            self.assertEqual(set(names), {"sstore-jochemnet", "sstore-genesis"})
+            self.assertEqual(kept, ["sstore-jochemnet"])
+            self.assertEqual(limited, ["sstore-jochemnet"])
+
     def test_auto_format_keeps_legacy_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -134,6 +169,40 @@ class StatefulFixtureInputTests(unittest.TestCase):
             finally:
                 log.close()
             self.assertEqual(dest.read_text(), '{"config":{}}')
+
+    def test_replay_logs_and_counts_syncing_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = run.SweepLog(Path(tmp) / "logs")
+            cfg = SimpleNamespace(
+                run=SimpleNamespace(fail_fast=False, request_timeout_s=1),
+                besu=SimpleNamespace(engine_url="http://127.0.0.1:8551"),
+            )
+            line = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "engine_newPayloadV5",
+                "params": [{}],
+            })
+
+            def fake_post(_cfg, _secret, _session, _raw):
+                return 200, {"result": {"status": "SYNCING"}}, None
+
+            original = run.post_engine_line
+            run.post_engine_line = fake_post
+            try:
+                ok = run.replay_requests(
+                    cfg, b"", None, [line], "sstore.json::case", log,
+                    phase="testing",
+                )
+            finally:
+                run.post_engine_line = original
+                log.close()
+            events = (Path(tmp) / "logs" / "events.log").read_text()
+
+            self.assertTrue(ok)
+            self.assertEqual(log.failure_total, 1)
+            self.assertIn("FAILED", events)
+            self.assertIn("status=SYNCING", events)
+            self.assertIn("parent block unknown", events)
 
     def test_baseline_out_dir_falls_back_to_sudo(self):
         with tempfile.TemporaryDirectory() as tmp:
