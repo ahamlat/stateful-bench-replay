@@ -87,6 +87,8 @@ class TestsConfig:
     fixtures_subdir: str
     filter: str
     order: str
+    match_chain_head: bool  # stateful_engine: keep only fixtures that
+                            # chain onto the head after the pre-run
 
 
 @dataclasses.dataclass
@@ -193,6 +195,7 @@ def load_config(path: Path) -> Config:
             fixtures_subdir=str(t.get("fixtures_subdir", ".")),
             filter=str(t.get("filter", "*")),
             order=str(t.get("order", "alphabetical")),
+            match_chain_head=bool(t.get("match_chain_head", True)),
         ),
         run=RunConfig(
             reset_overlay=bool(r.get("reset_overlay", True)),
@@ -288,6 +291,7 @@ class SweepLog:
         self._failures = self.failures_path.open("a", buffering=1)
         self._events = self.events_path.open("a", buffering=1)
         self.counters: dict[str, dict[str, int]] = {}
+        self.failure_total = 0
 
     def event(self, msg: str) -> None:
         ts = dt.datetime.now().isoformat(timespec="seconds")
@@ -307,6 +311,7 @@ class SweepLog:
         b = self._bucket(source)
         b["fail"] += 1
         b["total"] += 1
+        self.failure_total += 1
         rec = {
             "ts": dt.datetime.now().isoformat(timespec="milliseconds"),
             "source": source,
@@ -1213,6 +1218,26 @@ def _last_newpayload_item_index(raw_lines) -> int:
     return last
 
 
+_MAX_LOGGED_FAILURES = 3
+
+
+def _fail_detail(kind: str, detail: dict) -> str:
+    """One-line reason for the event log, plus a hint for the usual causes."""
+    result = detail.get("result") or {}
+    status = (result.get("status")
+              or (result.get("payloadStatus") or {}).get("status") or "")
+    parts = [kind]
+    if status:
+        parts.append(f"status={status}")
+    if status.upper() == "SYNCING":
+        parts.append("(parent block unknown: this payload does not chain onto "
+                     "the current head)")
+    error = detail.get("error")
+    if error:
+        parts.append(f"error={error}")
+    return " ".join(str(p) for p in parts)
+
+
 def replay_requests(
     cfg: Config,
     secret: bytes,
@@ -1253,10 +1278,26 @@ def replay_requests(
     profile_active = False
     all_valid = True
     sent = 0
+    failed = 0
+
+    def record_failure(line_no: int, kind: str, detail: dict) -> None:
+        """Count the failure AND say so in the event log.
+
+        Without this, a phase where every newPayload came back SYNCING only
+        showed up in failures.jsonl and the run still looked successful.
+        """
+        nonlocal failed
+        failed += 1
+        log.record_fail(label, line_no, kind, detail)
+        if failed <= _MAX_LOGGED_FAILURES:
+            log.event(f"{prefix}{label}: line {line_no} "
+                      f"{detail.get('method', '?')} FAILED: "
+                      f"{_fail_detail(kind, detail)}")
+
     for i, (line_no, method, raw) in enumerate(_iter_rpc_lines(raw_lines)):
         if not method:
             all_valid = False
-            log.record_fail(label, line_no, "bad_json", {})
+            record_failure(line_no, "bad_json", {})
             if cfg.run.fail_fast:
                 return False
             continue
@@ -1271,7 +1312,7 @@ def replay_requests(
             log.event(f"{prefix}{label}: sent {sent} requests")
         if err is not None and body is None:
             all_valid = False
-            log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
+            record_failure(line_no, "http_error", {"method": method, "error": err})
             if cfg.run.fail_fast:
                 if profile_active:
                     profiler.stop()
@@ -1279,9 +1320,9 @@ def replay_requests(
             continue
         if status != 200:
             all_valid = False
-            log.record_fail(label, line_no, "http_status",
-                            {"method": method, "status": status,
-                             "body": json.dumps(body) if body is not None else err})
+            record_failure(line_no, "http_status",
+                           {"method": method, "status": status,
+                            "body": json.dumps(body) if body is not None else err})
             if cfg.run.fail_fast:
                 if profile_active:
                     profiler.stop()
@@ -1293,7 +1334,7 @@ def replay_requests(
             log.record_ok(label)
         else:
             all_valid = False
-            log.record_fail(label, line_no, kind, {"method": method, **detail})
+            record_failure(line_no, kind, {"method": method, **detail})
             if cfg.run.fail_fast:
                 if profile_active:
                     profiler.stop()
@@ -1303,6 +1344,9 @@ def replay_requests(
         profiler.stop()
     if sent:
         log.event(f"{prefix}{label}: sent {sent} requests (done)")
+    if failed:
+        log.event(f"{prefix}{label}: {failed} of {sent} requests FAILED "
+                  "(full detail in failures.jsonl)")
     return all_valid if require_all_valid else True
 
 
@@ -1405,6 +1449,184 @@ def _stateful_fixture_index(cfg: Config) -> dict[str, tuple[Path, str]]:
     return _stateful_fixture_index_for_root(str(_fixture_root(cfg).resolve()))
 
 
+def _normalize_block_hash(value: str) -> str:
+    raw = value.strip().lower()
+    if not raw.startswith("0x"):
+        raw = "0x" + raw
+    return raw
+
+
+def _payload_list_parent_hash(payloads) -> str | None:
+    """Parent hash of the first Engine payload in a fixture list, if present."""
+    if not isinstance(payloads, list) or not payloads:
+        return None
+    entry = payloads[0]
+    if not isinstance(entry, dict):
+        return None
+    params = entry.get("params")
+    if not isinstance(params, list) or not params or not isinstance(params[0], dict):
+        return None
+    parent = params[0].get("parentHash")
+    if isinstance(parent, str) and parent.startswith("0x"):
+        return _normalize_block_hash(parent)
+    return None
+
+
+def _fixture_expected_parent_hash(fixture: dict) -> str | None:
+    """Hash the first setup (else testing) payload must have as its parent."""
+    parent = _payload_list_parent_hash(fixture.get("setupEngineNewPayloads"))
+    if parent:
+        return parent
+    return _payload_list_parent_hash(fixture.get("engineNewPayloads"))
+
+
+def _stateful_test_parent_hash(cfg: Config, name: str) -> str | None:
+    index = _stateful_fixture_index(cfg)
+    path, case_name = index[name]
+    cases = dict(_read_fixture_cases(path))
+    return _fixture_expected_parent_hash(cases[case_name])
+
+
+def _head_sidecar_path(snapshot_dir: Path) -> Path:
+    """Sibling file that stores the snapshot chain head as a hex hash.
+
+    Example: snapshot /data/besu-bumped -> /data/besu-bumped.head
+    Keep it outside the datadir so Besu does not see an extra file.
+    """
+    return snapshot_dir.parent / f"{snapshot_dir.name}.head"
+
+
+def write_head_sidecar(snapshot_dir: Path, block_hash: str, log: SweepLog) -> None:
+    path = _head_sidecar_path(snapshot_dir)
+    body = _normalize_block_hash(block_hash) + "\n"
+    try:
+        path.write_text(body)
+        log.event(f"wrote chain-head sidecar {path}")
+        return
+    except OSError:
+        pass
+    res = subprocess.run(
+        ["sudo", "-n", "tee", str(path)],
+        input=body,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode == 0 and path.is_file():
+        log.event(f"wrote chain-head sidecar {path} with sudo")
+    else:
+        log.event(
+            f"could not write chain-head sidecar {path}: "
+            f"{(res.stderr or res.stdout or '').strip()}"
+        )
+
+
+def read_head_sidecar(snapshot_dir: Path) -> str | None:
+    path = _head_sidecar_path(snapshot_dir)
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text().strip().splitlines()[0]
+    except OSError:
+        return None
+    if raw.startswith("0x") and len(raw) >= 66:
+        return _normalize_block_hash(raw)
+    return None
+
+
+def filter_stateful_tests_for_head(
+    cfg: Config,
+    names: list[str],
+    head_hash: str,
+    log: SweepLog,
+) -> list[str]:
+    """Keep fixtures whose first payload parent is `head_hash`."""
+    head = _normalize_block_hash(head_hash)
+    kept: list[str] = []
+    skipped = 0
+    examples: list[str] = []
+    for name in names:
+        parent = _stateful_test_parent_hash(cfg, name)
+        if parent == head:
+            kept.append(name)
+            continue
+        skipped += 1
+        if len(examples) < 5:
+            examples.append(f"{name} parent={parent or 'missing'}")
+    if skipped:
+        log.event(
+            f"chain-head filter: kept {len(kept)}, skipped {skipped} "
+            f"(first parent != {head})"
+        )
+        for line in examples:
+            log.event(f"  skip {line}")
+    else:
+        log.event(f"chain-head filter: kept {len(kept)} fixture(s) on {head}")
+    return kept
+
+
+def probe_snapshot_head(
+    cfg: Config, secret: bytes, log: SweepLog
+) -> str | None:
+    """Start Besu on the current baseline, optionally replay prelude, read head."""
+    log.event("chain-head filter: no sidecar; starting Besu once to read head")
+    try:
+        reset_to_baseline(cfg, log)
+        start_besu(cfg.besu, log)
+        wait_for_engine(cfg.besu, secret, log)
+        with requests.Session() as session:
+            for fname in cfg.input.prelude:
+                src = cfg.input.dir / fname
+                if src.is_file():
+                    replay_file(cfg, secret, session, src, log, phase="head-probe")
+        head = query_chain_head(cfg.besu)
+    finally:
+        stop_container(cfg.besu.container_name)
+    if head is None:
+        log.event("chain-head filter: could not read chain head over RPC")
+        return None
+    _num, block_hash = head
+    log.event(f"chain-head filter: probed head = #{_num:,} ({block_hash})")
+    # Only persist when the head is already in the snapshot (empty prelude).
+    if not cfg.input.prelude:
+        write_head_sidecar(cfg.besu.data_snapshot_dir, block_hash, log)
+    return _normalize_block_hash(block_hash)
+
+
+def _match_chain_head_enabled(cfg: Config) -> bool:
+    return _test_format(cfg) == "stateful_engine" and cfg.tests.match_chain_head
+
+
+def apply_chain_head_filter(
+    cfg: Config,
+    tests: list[str],
+    log: SweepLog,
+    *,
+    dry_run: bool,
+    secret: bytes | None = None,
+) -> list[str]:
+    """Drop genesis-style fixtures that do not chain onto the pre-run head."""
+    if not _match_chain_head_enabled(cfg):
+        return tests
+    head = read_head_sidecar(cfg.besu.data_snapshot_dir)
+    if head is not None:
+        log.event(
+            f"chain-head filter: using sidecar {_head_sidecar_path(cfg.besu.data_snapshot_dir)}"
+        )
+    elif dry_run:
+        log.event(
+            "chain-head filter: no <snapshot>.head sidecar; dry-run keeps all "
+            "matches. Run without --dry-run once, or re-run --prepare-baseline."
+        )
+        return tests
+    elif secret is not None:
+        head = probe_snapshot_head(cfg, secret, log)
+    if head is None:
+        log.event("chain-head filter: no head hash; not filtering")
+        return tests
+    return filter_stateful_tests_for_head(cfg, tests, head, log)
+
+
 def _rpc_version(value, field: str, source: str) -> int:
     try:
         version = int(str(value), 0)
@@ -1490,7 +1712,8 @@ def _stateful_test_requests(
 
 
 def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
-                   explicit: list[str] | None = None) -> list[str]:
+                   explicit: list[str] | None = None,
+                   defer_limit: bool = False) -> list[str]:
     """Return ordered list of basenames present in BOTH setup/ and testing/ that match the filter.
 
     When `explicit` is given (e.g. an arbitrary multi-selection from the web
@@ -1530,7 +1753,7 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
                 random.shuffle(selected)
             else:
                 raise ValueError(f"unknown tests.order: {cfg.tests.order}")
-        if limit is not None and limit >= 0:
+        if not defer_limit and limit is not None and limit >= 0:
             selected = selected[:limit]
         return selected
 
@@ -1570,7 +1793,7 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
             preview = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
             print(f"warn: {len(missing)} requested test(s) are not valid setup/testing "
                   f"pairs and were skipped: {preview}", file=sys.stderr)
-        if limit is not None and limit >= 0:
+        if not defer_limit and limit is not None and limit >= 0:
             selected = selected[:limit]
         return selected
 
@@ -1586,7 +1809,7 @@ def discover_tests(cfg: Config, filter_override: str | None, limit: int | None,
         random.shuffle(matched)
     else:
         raise ValueError(f"unknown tests.order: {order}")
-    if limit is not None and limit >= 0:
+    if not defer_limit and limit is not None and limit >= 0:
         matched = matched[:limit]
     return matched
 
@@ -1714,6 +1937,12 @@ def bake_prelude_layer(
     return ok
 
 
+def _apply_limit(tests: list[str], limit: int | None) -> list[str]:
+    if limit is not None and limit >= 0:
+        return tests[:limit]
+    return tests
+
+
 def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
               pick: bool, dry_run: bool, select: list[str] | None = None) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1721,20 +1950,24 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     log = SweepLog(log_root)
     log.event(f"sweep start, log dir = {log_root}")
 
-    tests = discover_tests(cfg, filter_override, limit, explicit=select)
+    defer_limit = _match_chain_head_enabled(cfg)
+    tests = discover_tests(
+        cfg, filter_override, limit, explicit=select, defer_limit=defer_limit,
+    )
     log.event(
         f"matched {len(tests)} tests "
-        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
+        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, "
+        f"limit={limit})"
     )
 
-    if pick and not dry_run:
-        tests = _interactive_pick(tests, log)
-
-    # Always record the resolved selection so a real run can be audited later
-    # (and so `--pick --dry-run` still prints a stable preview file).
-    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
-
     if dry_run:
+        tests = apply_chain_head_filter(cfg, tests, log, dry_run=True)
+        if pick:
+            # Preview the filtered list; do not prompt.
+            pass
+        tests = _apply_limit(tests, limit)
+        (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
+        log.event(f"dry-run: {len(tests)} test(s) after chain-head filter")
         log.event("dry-run: wrote selected_tests.txt and exiting")
         if pick:
             print()
@@ -1769,6 +2002,15 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
             ) from None
 
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    tests = apply_chain_head_filter(
+        cfg, tests, log, dry_run=False, secret=secret,
+    )
+    if pick:
+        tests = _interactive_pick(tests, log)
+    tests = _apply_limit(tests, limit)
+    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
+    log.event(f"running {len(tests)} test(s)")
+
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
 
@@ -1837,6 +2079,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     )
 
                 test_ok = True
+                failures_before = log.failure_total
 
                 # Phase A: prelude (gas-bump.txt then funding.txt) in this
                 # same container. Writes go into the test overlay layer.
@@ -1870,6 +2113,15 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                             f"[{idx}/{len(tests)}] head AFTER replay"
                         )
 
+                # A test whose payloads were rejected produced no measurement,
+                # so it must not report success even when fail_fast is off.
+                new_failures = log.failure_total - failures_before
+                if new_failures:
+                    log.event(f"[{idx}/{len(tests)}] {name}: {new_failures} "
+                              "failed request(s); this test produced NO valid "
+                              "measurement")
+                    test_ok = False
+
                 # Persist full container log before we tear it down. Failed
                 # runs get a -FAIL suffix to make them easy to spot. The
                 # filename embeds a slug of the test name so runs/<ts>/ ls
@@ -1884,7 +2136,10 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
 
                 if not test_ok:
                     sweep_ok = False
-                    break
+                    # fail_fast stops the sweep; otherwise keep going and
+                    # report the failure at the end.
+                    if cfg.run.fail_fast:
+                        break
 
         log.event(f"sweep end: ok={sweep_ok}")
     finally:
@@ -2003,7 +2258,9 @@ def _prepare_baseline_overlayfs(
                 cfg, secret, session, src, log, phase="prepare",
                 require_all_valid=True,
             )
+            after_head = None
             if ok:
+                after_head = query_chain_head(cfg.besu)
                 log_chain_head(cfg.besu, log, "head AFTER gas-bump")
             save_container_logs(
                 cfg.besu.container_name,
@@ -2037,6 +2294,8 @@ def _prepare_baseline_overlayfs(
                           + " ".join(shlex.quote(a) for a in rsync))
                 _run(rsync)
                 log.event(f"prepare-baseline: wrote pre-bumped snapshot to {out}")
+                if after_head is not None:
+                    write_head_sidecar(out, after_head[1], log)
         log.event(f"prepare-baseline end: ok={ok}")
     finally:
         if started and cfg.run.stop_container_on_exit:
@@ -2114,6 +2373,7 @@ def _prepare_baseline_schelk(
                 require_all_valid=True,
             )
             if ok:
+                after_head = query_chain_head(cfg.besu)
                 log_chain_head(cfg.besu, log, "head AFTER gas-bump")
             save_container_logs(
                 cfg.besu.container_name,
@@ -2129,6 +2389,8 @@ def _prepare_baseline_schelk(
                 schelk_promote(cfg, log)
                 log.event("prepare-baseline: promoted gas-bumped scratch onto the "
                           f"virgin baseline {cfg.schelk.virgin}")
+                if after_head is not None:
+                    write_head_sidecar(cfg.besu.data_snapshot_dir, after_head[1], log)
         log.event(f"prepare-baseline end: ok={ok}")
     finally:
         if started and cfg.run.stop_container_on_exit:
@@ -2878,14 +3140,20 @@ def run_compare(
     log.event(f"  x: label={label_x!r} image={image_x!r}")
     log.event(f"  y: label={label_y!r} image={image_y!r}")
 
-    tests = discover_tests(cfg, filter_override, limit, explicit=select)
+    defer_limit = _match_chain_head_enabled(cfg)
+    tests = discover_tests(
+        cfg, filter_override, limit, explicit=select, defer_limit=defer_limit,
+    )
     log.event(
         f"matched {len(tests)} tests "
-        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, limit={limit})"
+        f"(filter={filter_override or cfg.tests.filter}, order={cfg.tests.order}, "
+        f"limit={limit})"
     )
-    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
 
     if dry_run:
+        tests = apply_chain_head_filter(cfg, tests, log, dry_run=True)
+        tests = _apply_limit(tests, limit)
+        (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
         log.event("dry-run: wrote selected_tests.txt and exiting")
         log.flush_summary({
             "mode": "compare", "dry_run": True, "selected": len(tests),
@@ -2918,6 +3186,12 @@ def run_compare(
             ) from None
 
     secret = load_jwt_secret(cfg.besu.jwt_secret_path)
+    tests = apply_chain_head_filter(
+        cfg, tests, log, dry_run=False, secret=secret,
+    )
+    tests = _apply_limit(tests, limit)
+    (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
+    log.event(f"running {len(tests)} test(s)")
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
 
@@ -3069,6 +3343,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="how to reset Besu state between tests: 'overlayfs' "
                         "(OverlayFS over a snapshot dir, default) or 'schelk' "
                         "(dm-era block-level rollback). Overrides run.reset_backend.")
+    p.add_argument("--no-match-chain-head", dest="match_chain_head",
+                   action="store_false", default=None,
+                   help="keep stateful fixtures that do not chain onto the "
+                        "head after the pre-run (genesis-style cases). "
+                        "Default: drop them.")
     p.add_argument("--skip-gas-bump", "--no-gas-bump", dest="skip_gas_bump",
                    action="store_true", default=None,
                    help="skip the gas-bump prelude file (input.gas_bump_file); use "
@@ -3169,6 +3448,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.run.skip_gas_bump = True
     if args.persist_prelude:
         cfg.run.persist_prelude = True
+    if args.match_chain_head is False:
+        cfg.tests.match_chain_head = False
 
     if cfg.run.skip_gas_bump and cfg.run.persist_prelude:
         print(
