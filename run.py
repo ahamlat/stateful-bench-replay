@@ -62,6 +62,8 @@ class BesuConfig:
     startup_timeout_s: int
     container_data_path: str
     entrypoint: str | None
+    cpus: str | None           # docker --cpus (not --cpu); None = no quota
+    java_opts: str | None      # passed as -e JAVA_OPTS=... to the Besu image
 
 
 @dataclasses.dataclass
@@ -177,6 +179,8 @@ def load_config(path: Path) -> Config:
             startup_timeout_s=int(b.get("startup_timeout_s", 120)),
             container_data_path=str(b.get("container_data_path", "/opt/besu/data")),
             entrypoint=(str(b["entrypoint"]) if b.get("entrypoint") else None),
+            cpus=(str(b["cpus"]) if b.get("cpus") is not None else None),
+            java_opts=(str(b["java_opts"]).strip() if b.get("java_opts") else None),
         ),
         input=InputConfig(
             dir=_abs_path(i["dir"]),
@@ -650,6 +654,21 @@ def _profile_output_filename(run_id: str, idx: int, name: str, phase: str, fmt: 
     return f"{run_id}-{idx:04d}-{_slugify(name)}-{phase}.{ext}"
 
 
+def docker_runtime_args(cfg: BesuConfig) -> list[str]:
+    """Docker CPU quota and JVM env for `docker run` (before the image name).
+
+    Docker's flag is `--cpus`, not `--cpu`. Besu's launcher reads `JAVA_OPTS`.
+    `-XX:+AlwaysPreTouch` walks the heap at start (JVM heap prewarm).
+    """
+    args: list[str] = []
+    if getattr(cfg, "cpus", None) is not None:
+        args += ["--cpus", str(cfg.cpus)]
+    java_opts = getattr(cfg, "java_opts", None)
+    if java_opts:
+        args += ["-e", f"JAVA_OPTS={java_opts}"]
+    return args
+
+
 def start_besu(
     cfg: BesuConfig,
     log: SweepLog,
@@ -682,6 +701,9 @@ def start_besu(
         "run", "-d",
         "--name", cfg.container_name,
         "--network", "host",
+    ]
+    docker_cmd += docker_runtime_args(cfg)
+    docker_cmd += [
         # Disable Docker's default seccomp profile. async-profiler needs
         # perf_event_open / ptrace / mmap with PROT_EXEC for trampolines,
         # all of which are restricted (or outright blocked) by the default
