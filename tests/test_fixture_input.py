@@ -295,6 +295,23 @@ class StatefulFixtureInputTests(unittest.TestCase):
         self.assertEqual(body["params"][0]["safeBlockHash"], run.ZERO_HASH)
         self.assertIsNone(body["params"][1])
 
+    def test_docker_runtime_args_cpus_and_java_opts(self):
+        cfg = SimpleNamespace(
+            cpus="6",
+            java_opts="-Xms8g -Xmx8g -XX:+AlwaysPreTouch",
+        )
+        self.assertEqual(
+            run.docker_runtime_args(cfg),
+            [
+                "--cpus", "6",
+                "-e", "JAVA_OPTS=-Xms8g -Xmx8g -XX:+AlwaysPreTouch",
+            ],
+        )
+        self.assertEqual(
+            run.docker_runtime_args(SimpleNamespace(cpus=None, java_opts=None)),
+            [],
+        )
+
     def test_isolation_rewind_is_valid(self):
         self.assertEqual(run._validate_isolation("rewind"), "rewind")
         self.assertEqual(run._validate_isolation("RESTART"), "restart")

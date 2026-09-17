@@ -50,6 +50,14 @@ besu:
   # With `--network host` this is 127.0.0.1:8551.
   engine_url: http://127.0.0.1:8551
 
+  # Docker CPU quota (`docker run --cpus`). There is no `--cpu` flag.
+  # Leave unset to use every host core. Set "6" to match a 6-core bench slot.
+  cpus: "6"
+
+  # JVM flags for the Besu image (`docker run -e JAVA_OPTS=...`).
+  # Heap prewarm. The JVM cannot pick up a new JAVA_OPTS on a running container.
+  java_opts: "-Xms8g -Xmx8g -XX:+AlwaysPreTouch"
+
   # Files / directories bind-mounted into the container, in addition to the
   # overlay test/merged → container_data_path mount the runner always adds.
   # Format: "host_path:container_path[:ro]" (standard `docker -v` syntax).
