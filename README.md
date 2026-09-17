@@ -471,6 +471,18 @@ scripts/install-async-profiler.sh                       # one-time
 ./runBenchmark.sh --filter '*sload_bloated*' --limit 1 --profile
 ```
 
+To attach to a Besu container that is already running (no `--profile` mount
+required):
+
+```bash
+scripts/profile-besu.sh 60
+scripts/profile-besu.sh 120 -o /tmp/besu-wall.html
+```
+
+Default: wall-clock, 5 ms interval, one stack per thread. The script copies
+async-profiler into the container if it is missing, samples for N seconds,
+then writes an HTML flame graph on the host.
+
 Flame graphs land in the run dir as `<run-id>-NNNN-<slug>-setup.html` and
 `…-testing.html`. Default event is `wall` (no kernel tuning). Set
 `profile.event: cpu` (after `sudo sysctl -w kernel.perf_event_paranoid=1`) for
