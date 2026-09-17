@@ -1538,31 +1538,39 @@ def _read_fixture_cases(path: Path) -> list[tuple[str, dict]]:
 
 
 @functools.lru_cache(maxsize=8)
-def _stateful_fixture_index_for_root(root_text: str) -> dict[str, tuple[Path, str]]:
+def _stateful_fixture_index_for_root(
+    root_text: str,
+) -> dict[str, tuple[Path, str, str | None]]:
     root = Path(root_text)
     if not root.is_dir():
         raise FileNotFoundError(f"stateful fixture dir missing: {root}")
 
-    found: list[tuple[str, Path]] = []
+    # Keep the first parent in the index. The chain-head filter used to parse
+    # the same large JSON file again for every case in that file. Compute
+    # fixture files can contain many cases and large transaction payloads, so
+    # that made `--limit 1` wait for minutes after discovery had completed.
+    found: list[tuple[str, Path, str | None]] = []
     for path in sorted(root.rglob("*.json")):
-        for name, _fixture in _read_fixture_cases(path):
-            found.append((name, path))
+        for name, fixture in _read_fixture_cases(path):
+            found.append((name, path, _fixture_expected_parent_hash(fixture)))
 
     counts: dict[str, int] = {}
-    for name, _path in found:
+    for name, _path, _parent in found:
         counts[name] = counts.get(name, 0) + 1
 
-    index: dict[str, tuple[Path, str]] = {}
-    for name, path in found:
+    index: dict[str, tuple[Path, str, str | None]] = {}
+    for name, path, parent in found:
         display = name
         if counts[name] > 1:
             display = f"{path.relative_to(root).as_posix()}::{name}"
-        index[display] = (path, name)
+        index[display] = (path, name, parent)
     return index
 
 
-def _stateful_fixture_index(cfg: Config) -> dict[str, tuple[Path, str]]:
-    """Map display names to their JSON file and dictionary key."""
+def _stateful_fixture_index(
+    cfg: Config,
+) -> dict[str, tuple[Path, str, str | None]]:
+    """Map display names to their JSON file, dictionary key, and first parent."""
     return _stateful_fixture_index_for_root(str(_fixture_root(cfg).resolve()))
 
 
@@ -1599,9 +1607,8 @@ def _fixture_expected_parent_hash(fixture: dict) -> str | None:
 
 def _stateful_test_parent_hash(cfg: Config, name: str) -> str | None:
     index = _stateful_fixture_index(cfg)
-    path, case_name = index[name]
-    cases = dict(_read_fixture_cases(path))
-    return _fixture_expected_parent_hash(cases[case_name])
+    _path, _case_name, parent = index[name]
+    return parent
 
 
 def _head_sidecar_path(snapshot_dir: Path) -> Path:
@@ -1811,7 +1818,7 @@ def _stateful_test_requests(
 ) -> tuple[list[str], list[str], str]:
     index = _stateful_fixture_index(cfg)
     try:
-        path, case_name = index[name]
+        path, case_name, _parent = index[name]
     except KeyError as exc:
         raise KeyError(f"unknown stateful fixture test: {name}") from exc
     cases = dict(_read_fixture_cases(path))
