@@ -114,7 +114,16 @@ class StatefulFixtureInputTests(unittest.TestCase):
             names = run.discover_tests(cfg, "*sstore*", None)
             log = run.SweepLog(root / "logs")
             try:
-                kept = run.filter_stateful_tests_for_head(cfg, names, head, log)
+                # Discovery stores parent hashes in the fixture index. Filtering
+                # must not parse each large fixture file again for every case.
+                with unittest.mock.patch.object(
+                    run,
+                    "_read_fixture_cases",
+                    side_effect=AssertionError("fixture was parsed again"),
+                ):
+                    kept = run.filter_stateful_tests_for_head(
+                        cfg, names, head, log
+                    )
                 limited = run._apply_limit(kept, 1)
             finally:
                 log.close()
