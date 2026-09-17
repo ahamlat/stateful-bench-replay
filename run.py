@@ -4,17 +4,10 @@
 Boots a Besu container against an OverlayFS-mounted snapshot and replays
 JSON-RPC newPayload/forkchoiceUpdated lines through the Engine API.
 
-Per sweep:
-  1. Reset both overlay layers (prelude + test) and start Besu.
-  2. Replay prelude (gas-bump.txt then funding.txt).
-  3. Stop Besu.
-  4. For each selected test:
-       - reset ONLY the test overlay layer (prelude writes are preserved by
-         the two-layer overlay, so gas-bump+funding don't have to be replayed)
-       - start Besu, wait for Engine API
-       - replay setup/<name>.txt then testing/<name>.txt
-       - stop Besu
-  5. Write summary.
+Isolation (`run.isolation`):
+  restart (stateful, default): reset disk, start Besu, prelude, one test, stop.
+  rewind (compute): start Besu once, prelude once, then for each test replay
+    setup+testing and FCU (optional debug_setHead) back to the pre-run head.
 
 Usage:
     python3 run.py --config config.yaml [--filter '*BALANCE*'] [--limit 1] [--dry-run]
@@ -113,6 +106,10 @@ class SchelkConfig:
 class RunConfig:
     reset_overlay: bool
     reset_backend: str
+    isolation: str        # restart | rewind (see ISOLATION_MODES)
+    rewind_debug_sethead: bool  # also call debug_setHead (Besu compute: false)
+    rewind_fcu_version: int     # engine_forkchoiceUpdatedV* for rewind FCU
+    post_test_sleep_s: float    # pause after rewind (benchmarkoor compute: 0.2)
     log_dir: Path
     request_timeout_s: int
     fail_fast: bool
@@ -161,12 +158,10 @@ def _abs_path(p: str | os.PathLike) -> Path:
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text())
     b, i, t, r = raw["besu"], raw["input"], raw["tests"], raw["run"]
-    if "isolation" in r:
-        print(
-            "warn: run.isolation is no longer used (only the per-test restart mode "
-            "is supported); ignoring it",
-            file=sys.stderr,
-        )
+    isolation = _validate_isolation(r.get("isolation", "restart"))
+    post_sleep = r.get("post_test_sleep_s")
+    if post_sleep is None:
+        post_sleep = 0.2 if isolation == "rewind" else 0.0
     return Config(
         besu=BesuConfig(
             image=b["image"],
@@ -200,6 +195,10 @@ def load_config(path: Path) -> Config:
         run=RunConfig(
             reset_overlay=bool(r.get("reset_overlay", True)),
             reset_backend=_validate_backend(r.get("reset_backend", "overlayfs")),
+            isolation=isolation,
+            rewind_debug_sethead=bool(r.get("rewind_debug_sethead", False)),
+            rewind_fcu_version=int(r.get("rewind_fcu_version", 4)),
+            post_test_sleep_s=float(post_sleep),
             log_dir=_abs_path(r.get("log_dir", "./runs")),
             request_timeout_s=int(r.get("request_timeout_s", 120)),
             fail_fast=bool(r.get("fail_fast", False)),
@@ -213,6 +212,7 @@ def load_config(path: Path) -> Config:
 
 
 RESET_BACKENDS = ("overlayfs", "schelk")
+ISOLATION_MODES = ("restart", "rewind")
 
 
 def _validate_backend(value: str) -> str:
@@ -222,6 +222,31 @@ def _validate_backend(value: str) -> str:
             f"run.reset_backend must be one of {RESET_BACKENDS}, got {value!r}"
         )
     return value
+
+
+def _validate_isolation(value: str) -> str:
+    value = str(value).lower()
+    if value not in ISOLATION_MODES:
+        raise ValueError(
+            f"run.isolation must be one of {ISOLATION_MODES}, got {value!r}"
+        )
+    return value
+
+
+def warn_if_rewind_fixture_mix(cfg: Config) -> None:
+    """Compute isolation must not point at the stateful fixture tree."""
+    if cfg.run.isolation != "rewind":
+        return
+    sub = cfg.tests.fixtures_subdir.replace("\\", "/").lower()
+    if "compute" in sub:
+        return
+    print(
+        "warn: run.isolation=rewind is the compute loop, but "
+        f"tests.fixtures_subdir={cfg.tests.fixtures_subdir!r} does not contain "
+        "'compute'. Extract the compute tarball into a separate directory "
+        "(see config.compute.example.yaml). Do not mix with stateful fixtures.",
+        file=sys.stderr,
+    )
 
 
 def _load_schelk(raw: dict | None) -> SchelkConfig:
@@ -1132,6 +1157,98 @@ def log_chain_head(cfg: BesuConfig, log: SweepLog, prefix: str) -> None:
         log.event(f"{prefix}: head = #{n:,} ({h})")
 
 
+def rewind_forkchoice_line(head_hash: str, version: int) -> str:
+    """Engine FCU that sets canonical head back to `head_hash`."""
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": f"engine_forkchoiceUpdatedV{version}",
+        "params": [{
+            "headBlockHash": head_hash,
+            "safeBlockHash": ZERO_HASH,
+            "finalizedBlockHash": ZERO_HASH,
+        }, None],
+    }, separators=(",", ":"))
+
+
+def debug_set_head(cfg: BesuConfig, block_number: int) -> tuple[bool, str]:
+    """Besu/Geth debug_setHead on the HTTP JSON-RPC port. Hex block number."""
+    url = _rpc_http_url(cfg)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "debug_setHead",
+        "params": [hex(block_number)],
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        body = r.json()
+        if "error" in body:
+            return False, json.dumps(body["error"])
+        return True, ""
+    except (requests.RequestException, ValueError) as e:
+        return False, repr(e)
+
+
+def rewind_canonical_head(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    log: SweepLog,
+    block_number: int,
+    block_hash: str,
+) -> bool:
+    """Move forkchoice (and optionally debug_setHead) back to the pre-run head.
+
+    Compute isolation keeps the Besu process. The next fixture's parentHash is
+    this head. A failed rewind is logged; the previous test's measurement
+    still stands.
+    """
+    raw = rewind_forkchoice_line(block_hash, cfg.run.rewind_fcu_version)
+    status, body, err = post_engine_line(cfg, secret, session, raw)
+    if err is not None and body is None:
+        log.event(f"rewind FCU: transport error {err}")
+        return False
+    if status != 200:
+        log.event(f"rewind FCU: HTTP {status} {body}")
+        return False
+    ok, kind, detail = _classify(
+        f"engine_forkchoiceUpdatedV{cfg.run.rewind_fcu_version}", body or {}
+    )
+    if not ok:
+        log.event(f"rewind FCU: {_fail_detail(kind, detail)}")
+        return False
+    log.event(
+        f"rewind FCU(VALID) head {block_hash[:10]}… "
+        f"(engine_forkchoiceUpdatedV{cfg.run.rewind_fcu_version})"
+    )
+
+    if cfg.run.rewind_debug_sethead:
+        d_ok, d_err = debug_set_head(cfg.besu, block_number)
+        if not d_ok:
+            log.event(f"rewind debug_setHead #{block_number:,} failed: {d_err}")
+            return False
+        log.event(f"rewind debug_setHead #{block_number:,}")
+
+    head = query_chain_head(cfg.besu)
+    if head is None:
+        log.event("rewind: could not read chain head after FCU")
+        return False
+    n, h = head
+    if h.lower() != block_hash.lower() or n != block_number:
+        log.event(
+            f"rewind: head is #{n:,} ({h}), expected #{block_number:,} "
+            f"({block_hash})"
+        )
+        return False
+    if cfg.run.post_test_sleep_s > 0:
+        time.sleep(cfg.run.post_test_sleep_s)
+        log.event(f"rewind: slept {cfg.run.post_test_sleep_s}s")
+    return True
+
+
 def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
     """Return (ok, kind, detail). kind is empty when ok."""
     if "error" in body:
@@ -1854,6 +1971,76 @@ def _run_test_pair(cfg: Config, secret: bytes, session: requests.Session,
     return True
 
 
+def _make_test_profilers(
+    cfg: Config, log: SweepLog, idx: int, name: str,
+) -> tuple[ProfilerSession | None, ProfilerSession | None]:
+    if not cfg.profile.enabled:
+        return None, None
+    run_id = log.root.name
+    return (
+        ProfilerSession(
+            cfg.profile,
+            cfg.besu.container_name,
+            _profile_output_filename(
+                run_id, idx, name, "setup", cfg.profile.output_format
+            ),
+            log.root,
+            log,
+        ),
+        ProfilerSession(
+            cfg.profile,
+            cfg.besu.container_name,
+            _profile_output_filename(
+                run_id, idx, name, "testing", cfg.profile.output_format
+            ),
+            log.root,
+            log,
+        ),
+    )
+
+
+def _replay_prelude(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    log: SweepLog,
+    phase: str = "prelude",
+) -> bool:
+    for fname in cfg.input.prelude:
+        if not replay_file(
+            cfg, secret, session,
+            cfg.input.dir / fname, log, phase=phase,
+        ):
+            log.event(f"fail-fast tripped during prelude {fname}")
+            return False
+    return True
+
+
+def _finish_test_result(
+    cfg: Config,
+    log: SweepLog,
+    idx: int,
+    n_tests: int,
+    name: str,
+    test_ok: bool,
+    failures_before: int,
+) -> bool:
+    new_failures = log.failure_total - failures_before
+    if new_failures:
+        log.event(
+            f"[{idx}/{n_tests}] {name}: {new_failures} "
+            "failed request(s); this test produced NO valid "
+            "measurement"
+        )
+        test_ok = False
+    save_container_logs(
+        cfg.besu.container_name,
+        log.root / _besu_log_filename(idx, name, failed=not test_ok),
+        log,
+    )
+    return test_ok
+
+
 def _interactive_pick(tests: list[str], log: SweepLog) -> list[str]:
     """List matched tests and let the user pick exactly one."""
     if not tests:
@@ -2027,22 +2214,15 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     sweep_ok = False
                     tests = []
 
-            # Each test runs end-to-end in ONE Besu container:
-            #   reset overlay -> start Besu -> gas-bump -> funding ->
-            #   setup -> testing -> stop Besu
-            # No mid-flight restarts: every test sees the exact same warm-up
-            # path before the measured block.
-            for idx, name in enumerate(tests, start=1):
-                log.event(f"[{idx}/{len(tests)}] {name}")
+            rewind = cfg.run.isolation == "rewind"
+            rewind_target: tuple[int, str] | None = None
 
-                # Roll on-disk state back to the pristine baseline and remount.
-                # With the OverlayFS backend this wipes both overlay layers;
-                # with the schelk backend it does an incremental dm-era restore.
-                # With persist-prelude we instead wipe ONLY the test layer and
-                # keep the baked gas-bump prelude.
-                # Everything below writes into the freshly-reset state.
+            if rewind:
+                log.event(
+                    "isolation=rewind: one Besu process for the sweep; "
+                    "FCU back to the pre-run head after each test"
+                )
                 per_test_reset(cfg, log)
-
                 start_besu(
                     cfg.besu, log,
                     profile=cfg.profile if cfg.profile.enabled else None,
@@ -2050,56 +2230,55 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                 )
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
-                log_chain_head(
-                    cfg.besu, log,
-                    f"[{idx}/{len(tests)}] head BEFORE prelude"
-                )
+                log_chain_head(cfg.besu, log, "head BEFORE prelude")
+                if not _replay_prelude(cfg, secret, session, log):
+                    sweep_ok = False
+                    tests = []
+                else:
+                    log_chain_head(cfg.besu, log, "head AFTER prelude")
+                    rewind_target = query_chain_head(cfg.besu)
+                    if rewind_target is None:
+                        log.event("rewind: could not capture pre-run head; aborting")
+                        sweep_ok = False
+                        tests = []
+                    else:
+                        n, h = rewind_target
+                        log.event(f"rewind target: #{n:,} ({h})")
 
-                # Build profiler sessions for this test (one per phase).
-                # The runner brackets the LAST newPayload+FCU pair of each
-                # phase, which corresponds to the heavy setup block and the
-                # measured testing block respectively.
-                setup_profiler: ProfilerSession | None = None
-                testing_profiler: ProfilerSession | None = None
-                if cfg.profile.enabled:
-                    run_id = log.root.name  # the timestamp folder name
-                    setup_profiler = ProfilerSession(
-                        cfg.profile,
-                        cfg.besu.container_name,
-                        _profile_output_filename(run_id, idx, name, "setup", cfg.profile.output_format),
-                        log.root,
-                        log,
+            for idx, name in enumerate(tests, start=1):
+                log.event(f"[{idx}/{len(tests)}] {name}")
+
+                if not rewind:
+                    per_test_reset(cfg, log)
+                    start_besu(
+                        cfg.besu, log,
+                        profile=cfg.profile if cfg.profile.enabled else None,
+                        profile_output_dir=log.root if cfg.profile.enabled else None,
                     )
-                    testing_profiler = ProfilerSession(
-                        cfg.profile,
-                        cfg.besu.container_name,
-                        _profile_output_filename(run_id, idx, name, "testing", cfg.profile.output_format),
-                        log.root,
-                        log,
+                    started_container = True
+                    wait_for_engine(cfg.besu, secret, log)
+                    log_chain_head(
+                        cfg.besu, log,
+                        f"[{idx}/{len(tests)}] head BEFORE prelude"
                     )
+
+                setup_profiler, testing_profiler = _make_test_profilers(
+                    cfg, log, idx, name
+                )
 
                 test_ok = True
                 failures_before = log.failure_total
 
-                # Phase A: prelude (gas-bump.txt then funding.txt) in this
-                # same container. Writes go into the test overlay layer.
-                # Prelude is NOT profiled - it is identical across tests
-                # and not what we are measuring.
-                for fname in cfg.input.prelude:
-                    if not replay_file(
-                        cfg, secret, session,
-                        cfg.input.dir / fname, log, phase="prelude",
-                    ):
+                if not rewind:
+                    if not _replay_prelude(cfg, secret, session, log):
                         test_ok = False
-                        log.event(f"fail-fast tripped during prelude {fname}")
-                        break
+                    else:
+                        log_chain_head(
+                            cfg.besu, log,
+                            f"[{idx}/{len(tests)}] head AFTER prelude"
+                        )
 
                 if test_ok:
-                    log_chain_head(
-                        cfg.besu, log,
-                        f"[{idx}/{len(tests)}] head AFTER prelude"
-                    )
-                    # Phase B: setup + testing in the SAME container.
                     if not _run_test_pair(
                         cfg, secret, session,
                         setup_dir, testing_dir, name, log,
@@ -2113,31 +2292,29 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                             f"[{idx}/{len(tests)}] head AFTER replay"
                         )
 
-                # A test whose payloads were rejected produced no measurement,
-                # so it must not report success even when fail_fast is off.
-                new_failures = log.failure_total - failures_before
-                if new_failures:
-                    log.event(f"[{idx}/{len(tests)}] {name}: {new_failures} "
-                              "failed request(s); this test produced NO valid "
-                              "measurement")
-                    test_ok = False
-
-                # Persist full container log before we tear it down. Failed
-                # runs get a -FAIL suffix to make them easy to spot. The
-                # filename embeds a slug of the test name so runs/<ts>/ ls
-                # is self-documenting once you have several tests.
-                save_container_logs(
-                    cfg.besu.container_name,
-                    log.root / _besu_log_filename(idx, name, failed=not test_ok),
-                    log,
+                test_ok = _finish_test_result(
+                    cfg, log, idx, len(tests), name, test_ok, failures_before
                 )
-                stop_container(cfg.besu.container_name)
-                started_container = False
+
+                if rewind:
+                    if rewind_target is not None:
+                        n, h = rewind_target
+                        if not rewind_canonical_head(
+                            cfg, secret, session, log, n, h
+                        ):
+                            log.event(
+                                f"[{idx}/{len(tests)}] rewind FAILED; "
+                                "later tests may SYNCING"
+                            )
+                            sweep_ok = False
+                            if cfg.run.fail_fast:
+                                break
+                else:
+                    stop_container(cfg.besu.container_name)
+                    started_container = False
 
                 if not test_ok:
                     sweep_ok = False
-                    # fail_fast stops the sweep; otherwise keep going and
-                    # report the failure at the end.
                     if cfg.run.fail_fast:
                         break
 
@@ -2147,6 +2324,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
             "config": {
                 "image": cfg.besu.image,
                 "snapshot": str(cfg.besu.data_snapshot_dir),
+                "isolation": cfg.run.isolation,
                 "input_dir": str(cfg.input.dir),
                 "filter": filter_override or cfg.tests.filter,
                 "order": cfg.tests.order,
@@ -2642,9 +2820,10 @@ def _run_version(
     """Run every selected test once against `cfg.besu.image`, timing the
     testing phase. Returns {test_name: per-test metrics}.
 
-    Mirrors the per-test flow of `run_sweep` (reset overlay -> start Besu ->
-    prelude -> setup -> testing -> stop) but without profiling, and with the
-    testing phase timed via `_replay_file_measure`.
+    Mirrors the per-test flow of `run_sweep` (restart: reset overlay -> start
+    Besu -> prelude -> setup -> testing -> stop; rewind: one process + FCU
+    back to the pre-run head) but without profiling, and with the testing
+    phase timed via `_replay_file_measure`.
     """
     results: dict[str, dict] = {}
     started_container = False
@@ -2657,31 +2836,56 @@ def _run_version(
                     log.event(f"[{label}] persist-prelude: gas-bump bake FAILED; "
                               "skipping this version's tests")
                     return results
-            for idx, name in enumerate(tests, start=1):
-                log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
-
+            rewind = cfg.run.isolation == "rewind"
+            rewind_target: tuple[int, str] | None = None
+            if rewind:
+                log.event(f"[{label}] isolation=rewind: one Besu process")
                 per_test_reset(cfg, log)
-                # Cold-cache guarantee: flush + drop the page cache before
-                # every test so neither version benefits from state cached
-                # by the previous test/version.
-                drop_page_cache(log)
                 start_besu(cfg.besu, log)
                 started_container = True
                 wait_for_engine(cfg.besu, secret, log)
-
-                test_ok = True
-
-                # Prelude (gas-bump then funding) — not timed, identical per test.
+                prelude_ok = True
                 for fname in cfg.input.prelude:
                     ok, _ = _replay_file_measure(
                         cfg, secret, session, cfg.input.dir / fname, log,
                         source_label=f"[{label}] {fname}", phase="prelude",
                     )
                     if not ok:
-                        test_ok = False
-                        if cfg.run.fail_fast:
-                            log.event(f"[{label}] fail-fast tripped during prelude {fname}")
-                            break
+                        prelude_ok = False
+                        break
+                if not prelude_ok:
+                    log.event(f"[{label}] prelude FAILED; skipping this version")
+                    return results
+                rewind_target = query_chain_head(cfg.besu)
+                if rewind_target is None:
+                    log.event(f"[{label}] rewind: no pre-run head; skipping")
+                    return results
+                n, h = rewind_target
+                log.event(f"[{label}] rewind target: #{n:,} ({h})")
+
+            for idx, name in enumerate(tests, start=1):
+                log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
+
+                test_ok = True
+                if not rewind:
+                    per_test_reset(cfg, log)
+                    drop_page_cache(log)
+                    start_besu(cfg.besu, log)
+                    started_container = True
+                    wait_for_engine(cfg.besu, secret, log)
+
+                    for fname in cfg.input.prelude:
+                        ok, _ = _replay_file_measure(
+                            cfg, secret, session, cfg.input.dir / fname, log,
+                            source_label=f"[{label}] {fname}", phase="prelude",
+                        )
+                        if not ok:
+                            test_ok = False
+                            if cfg.run.fail_fast:
+                                log.event(
+                                    f"[{label}] fail-fast tripped during prelude {fname}"
+                                )
+                                break
 
                 testing_metrics: dict | None = None
                 if test_ok or not cfg.run.fail_fast:
@@ -2723,8 +2927,19 @@ def _run_version(
                                f"{_slugify(name)}{'' if test_ok else '-FAIL'}.log"
                 )
                 save_container_logs(cfg.besu.container_name, besu_log_path, log)
-                stop_container(cfg.besu.container_name)
-                started_container = False
+                if rewind:
+                    if rewind_target is not None:
+                        n, h = rewind_target
+                        if not rewind_canonical_head(
+                            cfg, secret, session, log, n, h
+                        ):
+                            log.event(f"[{label}] rewind FAILED after {name}")
+                            test_ok = False
+                            if cfg.run.fail_fast:
+                                pass
+                else:
+                    stop_container(cfg.besu.container_name)
+                    started_container = False
 
                 # Pull gas-used / exec-time / Mgas/s straight from Besu's own
                 # "Imported #" line for the last (measured) block.
@@ -3343,6 +3558,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="how to reset Besu state between tests: 'overlayfs' "
                         "(OverlayFS over a snapshot dir, default) or 'schelk' "
                         "(dm-era block-level rollback). Overrides run.reset_backend.")
+    p.add_argument("--isolation", choices=ISOLATION_MODES, default=None,
+                   help="restart = new Besu container per test (stateful). "
+                        "rewind = one process, FCU back to the pre-run head "
+                        "after each test (compute / besu-bal-full). "
+                        "Overrides run.isolation.")
     p.add_argument("--no-match-chain-head", dest="match_chain_head",
                    action="store_false", default=None,
                    help="keep stateful fixtures that do not chain onto the "
@@ -3425,6 +3645,11 @@ def main(argv: list[str] | None = None) -> int:
             cfg.profile.lock = "10ms"
     if args.reset_backend:
         cfg.run.reset_backend = args.reset_backend
+    if args.isolation:
+        cfg.run.isolation = args.isolation
+    print(f"reset backend: {cfg.run.reset_backend}")
+    print(f"isolation: {cfg.run.isolation}")
+    warn_if_rewind_fixture_mix(cfg)
     if cfg.run.reset_backend == "schelk":
         missing = [k for k in ("virgin", "scratch", "ramdisk")
                    if not getattr(cfg.schelk, k)]
@@ -3437,7 +3662,6 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-    print(f"reset backend: {cfg.run.reset_backend}")
 
     # Gas-bump skip: when the snapshot already contains the gas-bumped blocks,
     # drop input.gas_bump_file from the prelude so it is not replayed. funding
@@ -3457,6 +3681,14 @@ def main(argv: list[str] | None = None) -> int:
             "Both remove the gas-bump from the per-test prelude, but --skip-gas-bump "
             "expects a pre-bumped snapshot while --persist-prelude bakes the gas-bump "
             "into a persistent overlay layer at sweep start. Pick one.",
+            file=sys.stderr,
+        )
+        return 2
+    if cfg.run.isolation == "rewind" and cfg.run.persist_prelude:
+        print(
+            "error: isolation=rewind keeps one Besu process and does not reset "
+            "the overlay between tests. --persist-prelude is for the restart "
+            "isolation loop. Use --skip-gas-bump with rewind.",
             file=sys.stderr,
         )
         return 2

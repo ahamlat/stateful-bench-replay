@@ -5,11 +5,19 @@ snapshot, so every test starts from the exact same chain state. For each
 selected test one Besu container does the whole flow end-to-end:
 
 ```
-reset baseline → start Besu → gas-bump → funding → setup/<name> → testing/<name> → stop Besu
+restart (stateful): reset baseline → start Besu → prelude → setup → testing → stop Besu
+rewind (compute):   reset once → start Besu once → prelude once →
+                    (setup → testing → FCU to pre-run head)* → stop Besu
 ```
 
-The only thing that changes between the two supported setups is **how the
-per-test state reset works**:
+`run.isolation: restart` is the default (one new container per test).
+`run.isolation: rewind` is the compute / `besu-bal-full` loop: the JVM stays
+up. Use [config.compute.example.yaml](config.compute.example.yaml) with a
+**separate** compute fixture directory. Do not point rewind at the stateful
+`eest-payloads/` tree.
+
+The only thing that changes between the two supported **disk** setups is **how
+the on-disk state reset works** (restart isolation only):
 
 | | **OverlayFS** (default) | **schelk** |
 |---|---|---|
@@ -40,6 +48,7 @@ Everything is driven by `./runBenchmark.sh`, a thin wrapper that bootstraps
 | `--tests-from FILE` | Run exactly the test basenames listed in `FILE` (one per line), in that order. Overrides `--filter`/`tests.order`. Used by the [web console](#web-console-ui) to run an arbitrary multi-selection. |
 | `--dry-run` | Resolve config + the test list and exit without touching the system. |
 | `--config, -c FILE` | Use a different config file (default `config.yaml`). |
+| `--isolation {restart,rewind}` | Override `run.isolation`. `restart` = new container per test (stateful). `rewind` = one process, FCU back to the pre-run head (compute). |
 
 ### Choosing the reset backend
 
@@ -157,6 +166,23 @@ line-delimited file during baseline preparation:
 # Run one test from the prepared snapshot.
 ./runBenchmark.sh --skip-gas-bump --filter '*sload*' --limit 1
 ```
+
+### Compute fixtures (jochemnet besu-bal-full)
+
+Compute uses the **same** pre-run snapshot as stateful. Isolation is different:
+one Besu process, then `engine_forkchoiceUpdated` back to that head after each
+test. Do not extract compute JSON into `eest-payloads/` next to sstore/sload.
+
+```bash
+cp config.compute.example.yaml config.compute.yaml
+# Extract the compute tarball into eest-payloads-compute/ (see that file).
+./runBenchmark.sh -c config.compute.yaml --skip-gas-bump --dry-run
+./runBenchmark.sh -c config.compute.yaml --skip-gas-bump --limit 1
+```
+
+`besu-bal-full` is `ethpandaops/besu:glamsterdam-devnet-8-0d7d0f5` (not AOT).
+Set `run.rewind_debug_sethead: true` only if you need Geth-style `debug_setHead`.
+The compute example leaves it false, matching Besu `rollback_strategy: none`.
 
 For each selected test, the runner reads `setupEngineNewPayloads` first. It
 then reads `engineNewPayloads` as the measured phase. For each fixture payload,

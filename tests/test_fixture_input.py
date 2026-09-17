@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import unittest.mock
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -276,6 +277,90 @@ class StatefulFixtureInputTests(unittest.TestCase):
 
         self.assertIn("--Xbal-state-root-timeout", run._rejected_options(logs))
         self.assertIsNone(run._rejected_options("Besu is starting\n"))
+
+    def test_rewind_fcu_line_points_head_at_pre_run_hash(self):
+        head = "0x" + "ef" * 32
+        body = json.loads(run.rewind_forkchoice_line(head, 4))
+        self.assertEqual(body["method"], "engine_forkchoiceUpdatedV4")
+        self.assertEqual(body["params"][0]["headBlockHash"], head)
+        self.assertEqual(body["params"][0]["safeBlockHash"], run.ZERO_HASH)
+        self.assertIsNone(body["params"][1])
+
+    def test_isolation_rewind_is_valid(self):
+        self.assertEqual(run._validate_isolation("rewind"), "rewind")
+        self.assertEqual(run._validate_isolation("RESTART"), "restart")
+        with self.assertRaises(ValueError):
+            run._validate_isolation("container-recreate")
+
+    def test_warns_when_rewind_points_at_stateful_fixtures(self):
+        cfg = SimpleNamespace(
+            run=SimpleNamespace(isolation="rewind"),
+            tests=SimpleNamespace(
+                fixtures_subdir="eest-payloads/geth/blockchain_tests_stateful_engine",
+            ),
+        )
+        buf = StringIO()
+        with unittest.mock.patch("sys.stderr", buf):
+            run.warn_if_rewind_fixture_mix(cfg)
+        self.assertIn("does not contain 'compute'", buf.getvalue())
+
+    def test_no_warn_when_rewind_fixtures_are_compute(self):
+        cfg = SimpleNamespace(
+            run=SimpleNamespace(isolation="rewind"),
+            tests=SimpleNamespace(
+                fixtures_subdir="eest-payloads-compute/geth/blockchain_tests_stateful_engine",
+            ),
+        )
+        buf = StringIO()
+        with unittest.mock.patch("sys.stderr", buf):
+            run.warn_if_rewind_fixture_mix(cfg)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_rewind_canonical_head_sends_fcu_and_optional_sethead(self):
+        head = "0x" + "aa" * 32
+        posted = []
+        cfg = SimpleNamespace(
+            run=SimpleNamespace(
+                rewind_fcu_version=4,
+                rewind_debug_sethead=True,
+                post_test_sleep_s=0,
+                request_timeout_s=1,
+            ),
+            besu=SimpleNamespace(
+                extra_args=["--rpc-http-port=8545"],
+                engine_url="http://127.0.0.1:8551",
+            ),
+        )
+        log = run.SweepLog(Path(tempfile.mkdtemp()) / "logs")
+
+        def fake_post(_cfg, _secret, _session, raw):
+            posted.append(json.loads(raw))
+            return 200, {"result": {"payloadStatus": {"status": "VALID"}}}, None
+
+        def fake_sethead(_besu, number):
+            posted.append({"method": "debug_setHead", "n": number})
+            return True, ""
+
+        original_post = run.post_engine_line
+        original_set = run.debug_set_head
+        original_query = run.query_chain_head
+        run.post_engine_line = fake_post
+        run.debug_set_head = fake_sethead
+        run.query_chain_head = lambda _besu: (24443820, head)
+        try:
+            ok = run.rewind_canonical_head(
+                cfg, b"s", None, log, 24443820, head,
+            )
+        finally:
+            run.post_engine_line = original_post
+            run.debug_set_head = original_set
+            run.query_chain_head = original_query
+            log.close()
+
+        self.assertTrue(ok)
+        self.assertEqual(posted[0]["method"], "engine_forkchoiceUpdatedV4")
+        self.assertEqual(posted[1]["method"], "debug_setHead")
+        self.assertEqual(posted[1]["n"], 24443820)
 
 
 if __name__ == "__main__":
