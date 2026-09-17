@@ -136,7 +136,18 @@ tests:
   order: alphabetical
 
 run:
-  # The runner always uses per-test isolation: at the start of every sweep
+  # Isolation between tests:
+  #   restart (default, stateful) - new Besu container + disk reset per test
+  #   rewind (compute / besu-bal-full) - one Besu process; after each test
+  #     send FCU (and optionally debug_setHead) back to the pre-run head.
+  #     Use config.compute.example.yaml for the jochemnet compute suite.
+  # Override with --isolation {restart,rewind}.
+  isolation: restart
+  # rewind_debug_sethead: false   # true = also Besu debug_setHead (Geth compute)
+  # rewind_fcu_version: 4
+  # post_test_sleep_s: 0.2        # default 0.2s when isolation=rewind, else 0
+
+  # The runner always uses per-test isolation when isolation=restart: at the start of every sweep
   # both overlay layers are wiped and Besu is started; the prelude
   # (gas-bump.txt then funding.txt) is replayed once into the prelude layer;
   # then for EACH selected test, Besu is stopped, ONLY the test layer is

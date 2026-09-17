@@ -1,0 +1,103 @@
+# Jochemnet COMPUTE replay (besu-bal-full), not stateful.
+#
+# Same Besu snapshot and pre-run as config.example.yaml. Different fixtures
+# and isolation: one Besu process, FCU back to the pre-run head after each
+# test (benchmarkoor rollback_strategy: none + 200ms sleep).
+#
+# Assumed public run: repricing / jochemnet/v1 / glamsterdam-devnet-8 /
+# compute / instance-id besu-bal-full (non-AOT).
+# Image: ethpandaops/besu:glamsterdam-devnet-8-0d7d0f5
+# Fixtures:
+#   https://github.com/ethpandaops/benchmarkoor-tests/releases/download/eest-payloads-jochemnet-v1-amsterdam-compute-e269bb44-20260903-131433/eest-payloads-jochemnet-v1-amsterdam-compute-geth.tar.gz
+#
+# Extract that tarball into a directory that is NOT the stateful tree:
+#   mkdir -p /home/ahamlat/benchmarkoor-build-artifacts/eest-payloads-compute
+#   tar -C /home/ahamlat/benchmarkoor-build-artifacts/eest-payloads-compute \
+#       -xzf eest-payloads-jochemnet-v1-amsterdam-compute-geth.tar.gz
+# Adjust fixtures_subdir if the archive already contains
+# benchmarkoor-build-artifacts/eest-payloads/geth/...
+#
+# Bake the pre-run once (same as stateful), then:
+#   cp config.compute.example.yaml config.compute.yaml
+#   ./runBenchmark.sh -c config.compute.yaml --skip-gas-bump --limit 1 --dry-run
+#   ./runBenchmark.sh -c config.compute.yaml --skip-gas-bump --filter '*bn128*' --limit 1
+
+besu:
+  image: ethpandaops/besu:glamsterdam-devnet-8-0d7d0f5
+  container_name: besu-bench
+  data_snapshot_dir: /data/besu
+  overlay_dir: /data/besu-overlay
+  container_data_path: /opt/besu/data
+  entrypoint: /opt/besu/bin/besu
+  jwt_secret_path: /tmp/jwtsecret
+  engine_url: http://127.0.0.1:8551
+  extra_mounts:
+    - /tmp/jwtsecret:/tmp/jwtsecret:ro
+    - /tmp/genesis.json:/tmp/genesis.json:ro
+  extra_args:
+    - --data-storage-format=BONSAI
+    - --genesis-state-hash-cache-enabled=true
+    - --p2p-enabled=false
+    - --sync-mode=FULL
+    - --max-peers=0
+    - --discovery-enabled=false
+    - --rpc-http-enabled=true
+    - --rpc-http-host=0.0.0.0
+    - --rpc-http-port=8545
+    - --rpc-http-api=ETH,NET,DEBUG,MINER,NET,PERM,ADMIN,TXPOOL,WEB3
+    - --rpc-http-cors-origins=*
+    - --Xhttp-timeout-seconds=660
+    - --host-allowlist=*
+    - --engine-rpc-enabled=true
+    - --engine-jwt-secret=/tmp/jwtsecret
+    - --engine-rpc-port=8551
+    - --engine-host-allowlist=*
+    - --metrics-enabled=true
+    - --metrics-host=0.0.0.0
+    - --metrics-port=8008
+    - --genesis-file=/tmp/genesis.json
+    - --Xplugin-rocksdb-high-spec-enabled=true
+    - --Xbal-perfect-parallelization-enabled=true
+    - --Xbal-state-root-enabled=true
+  startup_timeout_s: 120
+
+input:
+  dir: /home/ahamlat/benchmarkoor-build-artifacts
+  prelude:
+    - pre-runs/geth/pre_run_bundle/pre-run.request
+  gas_bump_file: pre-runs/geth/pre_run_bundle/pre-run.request
+
+tests:
+  format: stateful_engine
+  # Separate tree from eest-payloads/geth/... (stateful). Do not mix.
+  fixtures_subdir: eest-payloads-compute/geth/blockchain_tests_stateful_engine
+  setup_subdir: setup
+  testing_subdir: testing
+  filter: "*"
+  match_chain_head: true
+  order: alphabetical
+
+run:
+  isolation: rewind
+  rewind_debug_sethead: false
+  rewind_fcu_version: 4
+  post_test_sleep_s: 0.2
+  reset_overlay: true
+  reset_backend: overlayfs
+  log_dir: ./runs
+  request_timeout_s: 120
+  fail_fast: false
+  stop_container_on_exit: true
+  skip_gas_bump: true
+  persist_prelude: false
+
+profile:
+  enabled: false
+  host_dir: /home/ahamlat/async-profiler
+  container_dir: /opt/async-profiler
+  event: wall
+  interval: 1ms
+  output_format: html
+  extra_args:
+    - -t
+  log_level: warn
