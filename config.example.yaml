@@ -55,8 +55,9 @@ besu:
   cpus: "6"
 
   # JVM flags for the Besu image (`docker run -e JAVA_OPTS=...`).
-  # Heap prewarm. The JVM cannot pick up a new JAVA_OPTS on a running container.
-  java_opts: "-Xms8g -Xmx8g -XX:+AlwaysPreTouch"
+  # Heap prewarm. DebugNonSafepoints lets async-profiler unwind at any PC,
+  # not only at safepoint polls. Restart Besu after you change this string.
+  java_opts: "-Xms8g -Xmx8g -XX:+AlwaysPreTouch -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints"
 
   # Files / directories bind-mounted into the container, in addition to the
   # overlay test/merged → container_data_path mount the runner always adds.

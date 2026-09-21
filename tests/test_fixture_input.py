@@ -131,6 +131,16 @@ class StatefulFixtureInputTests(unittest.TestCase):
             self.assertEqual(set(names), {"sstore-jochemnet", "sstore-genesis"})
             self.assertEqual(kept, ["sstore-jochemnet"])
             self.assertEqual(limited, ["sstore-jochemnet"])
+            self.assertEqual(run._stateful_payload_counts(cfg, kept), (1, 1))
+            self.assertEqual(
+                run._test_block_suffix(cfg, "sstore-jochemnet"),
+                " (1 setup + 1 testing)",
+            )
+
+    def test_progress_percent_uses_test_index(self):
+        self.assertEqual(run._test_progress(123, 2302), "[123/2302 (5%)]")
+        self.assertEqual(run._test_progress(1, 4), "[1/4 (25%)]")
+        self.assertEqual(run._test_progress(4, 4), "[4/4 (100%)]")
 
     def test_auto_format_keeps_legacy_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
