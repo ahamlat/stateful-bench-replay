@@ -1562,38 +1562,46 @@ def _read_fixture_cases(path: Path) -> list[tuple[str, dict]]:
 @functools.lru_cache(maxsize=8)
 def _stateful_fixture_index_for_root(
     root_text: str,
-) -> dict[str, tuple[Path, str, str | None]]:
+) -> dict[str, tuple[Path, str, str | None, int, int]]:
     root = Path(root_text)
     if not root.is_dir():
         raise FileNotFoundError(f"stateful fixture dir missing: {root}")
 
-    # Keep the first parent in the index. The chain-head filter used to parse
-    # the same large JSON file again for every case in that file. Compute
-    # fixture files can contain many cases and large transaction payloads, so
-    # that made `--limit 1` wait for minutes after discovery had completed.
-    found: list[tuple[str, Path, str | None]] = []
+    # Keep the first parent and payload counts in the index. The chain-head
+    # filter used to parse the same large JSON file again for every case.
+    found: list[tuple[str, Path, str | None, int, int]] = []
     for path in sorted(root.rglob("*.json")):
         for name, fixture in _read_fixture_cases(path):
-            found.append((name, path, _fixture_expected_parent_hash(fixture)))
+            found.append((
+                name,
+                path,
+                _fixture_expected_parent_hash(fixture),
+                _payload_len(fixture.get("setupEngineNewPayloads")),
+                _payload_len(fixture.get("engineNewPayloads")),
+            ))
 
     counts: dict[str, int] = {}
-    for name, _path, _parent in found:
+    for name, _path, _parent, _ns, _nt in found:
         counts[name] = counts.get(name, 0) + 1
 
-    index: dict[str, tuple[Path, str, str | None]] = {}
-    for name, path, parent in found:
+    index: dict[str, tuple[Path, str, str | None, int, int]] = {}
+    for name, path, parent, n_setup, n_testing in found:
         display = name
         if counts[name] > 1:
             display = f"{path.relative_to(root).as_posix()}::{name}"
-        index[display] = (path, name, parent)
+        index[display] = (path, name, parent, n_setup, n_testing)
     return index
 
 
 def _stateful_fixture_index(
     cfg: Config,
-) -> dict[str, tuple[Path, str, str | None]]:
-    """Map display names to their JSON file, dictionary key, and first parent."""
+) -> dict[str, tuple[Path, str, str | None, int, int]]:
+    """Map display names to JSON file, key, first parent, payload counts."""
     return _stateful_fixture_index_for_root(str(_fixture_root(cfg).resolve()))
+
+
+def _payload_len(payloads) -> int:
+    return len(payloads) if isinstance(payloads, list) else 0
 
 
 def _normalize_block_hash(value: str) -> str:
@@ -1629,8 +1637,48 @@ def _fixture_expected_parent_hash(fixture: dict) -> str | None:
 
 def _stateful_test_parent_hash(cfg: Config, name: str) -> str | None:
     index = _stateful_fixture_index(cfg)
-    _path, _case_name, parent = index[name]
+    _path, _case_name, parent, _n_setup, _n_testing = index[name]
     return parent
+
+
+def _stateful_payload_counts(cfg: Config, names: list[str]) -> tuple[int, int]:
+    """Sum setup and testing newPayload counts for the selected fixtures."""
+    index = _stateful_fixture_index(cfg)
+    n_setup = 0
+    n_testing = 0
+    for name in names:
+        _path, _case_name, _parent, setup, testing = index[name]
+        n_setup += setup
+        n_testing += testing
+    return n_setup, n_testing
+
+
+def log_fixture_workload(cfg: Config, tests: list[str], log: SweepLog) -> None:
+    if _test_format(cfg) != "stateful_engine":
+        return
+    n_setup, n_testing = _stateful_payload_counts(cfg, tests)
+    log.event(
+        f"workload: {len(tests)} tests, "
+        f"{n_setup} setup block(s) + {n_testing} testing block(s) "
+        f"= {n_setup + n_testing} imported payloads"
+    )
+
+
+def _test_progress(idx: int, n_tests: int) -> str:
+    """`[123/2302 (5%)]` — percent is this test index over the selected total."""
+    if n_tests <= 0:
+        return f"[{idx}/0]"
+    return f"[{idx}/{n_tests} ({100 * idx // n_tests}%)]"
+
+
+def _test_block_suffix(cfg: Config, name: str) -> str:
+    if _test_format(cfg) != "stateful_engine":
+        return ""
+    index = _stateful_fixture_index(cfg)
+    if name not in index:
+        return ""
+    _path, _case_name, _parent, n_setup, n_testing = index[name]
+    return f" ({n_setup} setup + {n_testing} testing)"
 
 
 def _head_sidecar_path(snapshot_dir: Path) -> Path:
@@ -1840,7 +1888,7 @@ def _stateful_test_requests(
 ) -> tuple[list[str], list[str], str]:
     index = _stateful_fixture_index(cfg)
     try:
-        path, case_name, _parent = index[name]
+        path, case_name, _parent, _n_setup, _n_testing = index[name]
     except KeyError as exc:
         raise KeyError(f"unknown stateful fixture test: {name}") from exc
     cases = dict(_read_fixture_cases(path))
@@ -2057,7 +2105,7 @@ def _finish_test_result(
     new_failures = log.failure_total - failures_before
     if new_failures:
         log.event(
-            f"[{idx}/{n_tests}] {name}: {new_failures} "
+            f"{_test_progress(idx, n_tests)} {name}: {new_failures} "
             "failed request(s); this test produced NO valid "
             "measurement"
         )
@@ -2184,6 +2232,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
         tests = _apply_limit(tests, limit)
         (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
         log.event(f"dry-run: {len(tests)} test(s) after chain-head filter")
+        log_fixture_workload(cfg, tests, log)
         log.event("dry-run: wrote selected_tests.txt and exiting")
         if pick:
             print()
@@ -2226,6 +2275,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
     tests = _apply_limit(tests, limit)
     (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
     log.event(f"running {len(tests)} test(s)")
+    log_fixture_workload(cfg, tests, log)
 
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
@@ -2275,7 +2325,10 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                         log.event(f"rewind target: #{n:,} ({h})")
 
             for idx, name in enumerate(tests, start=1):
-                log.event(f"[{idx}/{len(tests)}] {name}")
+                log.event(
+                    f"{_test_progress(idx, len(tests))} {name}"
+                    f"{_test_block_suffix(cfg, name)}"
+                )
 
                 if not rewind:
                     per_test_reset(cfg, log)
@@ -2288,7 +2341,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     wait_for_engine(cfg.besu, secret, log)
                     log_chain_head(
                         cfg.besu, log,
-                        f"[{idx}/{len(tests)}] head BEFORE prelude"
+                        f"{_test_progress(idx, len(tests))} head BEFORE prelude"
                     )
 
                 setup_profiler, testing_profiler = _make_test_profilers(
@@ -2304,7 +2357,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     else:
                         log_chain_head(
                             cfg.besu, log,
-                            f"[{idx}/{len(tests)}] head AFTER prelude"
+                            f"{_test_progress(idx, len(tests))} head AFTER prelude"
                         )
 
                 if test_ok:
@@ -2318,7 +2371,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                     else:
                         log_chain_head(
                             cfg.besu, log,
-                            f"[{idx}/{len(tests)}] head AFTER replay"
+                            f"{_test_progress(idx, len(tests))} head AFTER replay"
                         )
 
                 test_ok = _finish_test_result(
@@ -2332,7 +2385,7 @@ def run_sweep(cfg: Config, filter_override: str | None, limit: int | None,
                             cfg, secret, session, log, n, h
                         ):
                             log.event(
-                                f"[{idx}/{len(tests)}] rewind FAILED; "
+                                f"{_test_progress(idx, len(tests))} rewind FAILED; "
                                 "later tests may SYNCING"
                             )
                             sweep_ok = False
@@ -2893,7 +2946,10 @@ def _run_version(
                 log.event(f"[{label}] rewind target: #{n:,} ({h})")
 
             for idx, name in enumerate(tests, start=1):
-                log.event(f"[{label}] [{idx}/{len(tests)}] {name}")
+                log.event(
+                    f"[{label}] {_test_progress(idx, len(tests))} {name}"
+                    f"{_test_block_suffix(cfg, name)}"
+                )
 
                 test_ok = True
                 if not rewind:
@@ -3399,6 +3455,7 @@ def run_compare(
         tests = _apply_limit(tests, limit)
         (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
         log.event("dry-run: wrote selected_tests.txt and exiting")
+        log_fixture_workload(cfg, tests, log)
         log.flush_summary({
             "mode": "compare", "dry_run": True, "selected": len(tests),
             "version_x": {"label": label_x, "image": image_x},
@@ -3436,6 +3493,7 @@ def run_compare(
     tests = _apply_limit(tests, limit)
     (log_root / "selected_tests.txt").write_text("\n".join(tests) + "\n")
     log.event(f"running {len(tests)} test(s)")
+    log_fixture_workload(cfg, tests, log)
     setup_dir = cfg.input.dir / cfg.tests.setup_subdir
     testing_dir = cfg.input.dir / cfg.tests.testing_subdir
 

@@ -22,6 +22,9 @@ Usage: scripts/profile-besu.sh [DURATION_S] [options]
   -e, --event EVENT       asprof event (default: wall)
   -i, --interval INT      sample interval (default: 5ms)
       --no-threads        do not pass -t (one combined flame graph)
+      --lock [THRESH]     Java monitor / j.u.c contention (default thresh: 1ms).
+                          Alone: -e lock HTML flame graph. With --jfr: add
+                          --lock to a wall JFR (needed for mixed events).
   -o, --output FILE       host HTML/JFR path (default: ./besu-wall-<ts>.html)
       --jfr               write JFR instead of HTML
       --pid PID           JVM pid inside the container (default: detect)
@@ -31,6 +34,8 @@ Usage: scripts/profile-besu.sh [DURATION_S] [options]
 Examples:
   scripts/profile-besu.sh 60
   scripts/profile-besu.sh 120 -o /tmp/besu-wall.html
+  scripts/profile-besu.sh 60 --lock 1ms
+  scripts/profile-besu.sh 60 --jfr --lock 1ms -o /tmp/besu-lock.jfr
 EOF
 }
 
@@ -40,6 +45,7 @@ EVENT="${EVENT:-wall}"
 INTERVAL="${INTERVAL:-5ms}"
 THREADS=1
 FORMAT="html"
+LOCK=""
 OUT=""
 PID=""
 ASPROF_HOST="${ASPROF_HOST:-$HOME/async-profiler}"
@@ -66,6 +72,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --no-threads) THREADS=0; shift ;;
+        --lock)
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                LOCK="$2"
+                shift 2
+            else
+                LOCK="1ms"
+                shift
+            fi
+            ;;
         --jfr) FORMAT="jfr"; shift ;;
         -o|--output)
             OUT="${2:?missing output path}"
@@ -103,6 +118,10 @@ DURATION="${DURATION:-60}"
 if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [[ "$DURATION" -lt 1 ]]; then
     echo "profile-besu.sh: duration must be a positive integer, got $DURATION" >&2
     exit 2
+fi
+
+if [[ -n "$LOCK" && "$FORMAT" != "jfr" ]]; then
+    EVENT="lock"
 fi
 
 dock() {
@@ -173,6 +192,13 @@ asprof_start=(
     -e "$EVENT"
     -i "$INTERVAL"
 )
+if [[ -n "$LOCK" ]]; then
+    if [[ "$FORMAT" == "jfr" ]]; then
+        asprof_start+=(--lock "$LOCK")
+    else
+        INTERVAL="$LOCK"
+    fi
+fi
 if [[ "$THREADS" -eq 1 ]]; then
     asprof_start+=(-t)
 fi
@@ -212,7 +238,7 @@ stop_profiler() {
 
 trap 'stop_profiler; exit 130' INT TERM
 
-echo "profile-besu.sh: start event=$EVENT interval=$INTERVAL threads=$THREADS pid=$PID for ${DURATION}s"
+echo "profile-besu.sh: start event=$EVENT interval=$INTERVAL lock=${LOCK:-off} threads=$THREADS pid=$PID for ${DURATION}s"
 dock exec "$CONTAINER" "${asprof_start[@]}"
 STARTED=1
 
